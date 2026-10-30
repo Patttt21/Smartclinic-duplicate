@@ -1,0 +1,157 @@
+@import "tailwindcss";
+
+/* Class-based dark mode for Tailwind v4 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+html {
+  color-scheme: light;
+}
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+html.dark body {
+  @apply bg-slate-950 text-slate-100;
+}
+
+/* Native select / option contrast — readable in both themes */
+select {
+  color: inherit;
+  background-color: inherit;
+}
+html.dark select option {
+  background-color: #1e293b; /* slate-800 */
+  color: #f1f5f9; /* slate-100 */
+}
+html:not(.dark) select option {
+  background-color: #ffffff;
+  color: #0f172a; /* slate-900 */
+}
+
+/* Mobile-Friendly QR Scanner Viewport Styling */
+#qr-camera-viewport {
+  width: 100% !important;
+  position: relative;
+  overflow: hidden;
+  border-radius: 1rem;
+  background-color: #020617;
+}
+
+#qr-camera-viewport video {
+  width: 100% !important;
+  height: 100% !important;
+  min-height: 260px;
+  max-height: 340px;
+  object-fit: cover !important;
+  border-radius: 1rem;
+}
+
+#qr-camera-viewport__scan_region {
+  position: absolute !important;
+  inset: 0 !important;
+}
+
+#qr-camera-viewport__scan_region img {
+  display: none !important;
+}
+
+/* ==========================================================================
+   GLOBAL DIRECT REAL-TIME DOCUMENT PRINTING SYSTEM
+   Guarantees that when printing, ONLY the pure medical stationery inside
+   #smartclinic-print-mount renders on standard A4 portrait paper, completely
+   hiding all on-screen UI, headers, sidebars, buttons, and dialogs.
+   ========================================================================== */
+@media screen {
+  #smartclinic-print-mount,
+  #smartclinic-print-root {
+    display: none !important;
+    visibility: hidden !important;
+  }
+}
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 10mm 12mm;
+  }
+
+  /* Reset html & body to pure white paper */
+  html, body {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+    width: 100% !important;
+    min-width: 100% !important;
+    max-width: 100% !important;
+    height: auto !important;
+    min-height: 100% !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    color-scheme: light !important;
+    overflow: visible !important;
+  }
+
+  /* HIDE EVERYTHING ON SCREEN EXCEPT THE DEDICATED PRINT MOUNT */
+  #root,
+  .no-print,
+  .print-hidden,
+  .global-system-controls,
+  #smartclinic-notifications,
+  .toast-viewport,
+  button,
+  header,
+  aside,
+  nav,
+  main,
+  footer,
+  [role="dialog"],
+  [role="status"],
+  [role="alert"] {
+    display: none !important;
+    visibility: hidden !important;
+    height: 0 !important;
+    max-height: 0 !important;
+    width: 0 !important;
+    max-width: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+  }
+
+  /* DISPLAY ONLY THE DEDICATED CLINICAL PRINT STATIONERY */
+  #smartclinic-print-mount,
+  #smartclinic-print-root {
+    display: block !important;
+    visibility: visible !important;
+    position: static !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background-color: #ffffff !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
+    color-scheme: light !important;
+    overflow: visible !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+
+  #smartclinic-print-mount *,
+  #smartclinic-print-root * {
+    visibility: visible !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}
+
+

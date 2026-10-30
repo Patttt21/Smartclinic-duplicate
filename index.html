@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SmartClinic</title>
+    <meta name="description" content="SmartClinic: A Role-Based Web Application Integrating Predictive Analysis for Healthcare Management — outpatient scheduling, real-time queue notifications, EMR, and monthly predictive analytics." />
+    <meta property="og:title" content="SmartClinic" />
+    <meta property="og:description" content="SmartClinic: A Role-Based Web Application Integrating Predictive Analysis for Healthcare Management — outpatient scheduling, real-time queue notifications, EMR, and monthly predictive analytics." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#0d9488" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="SmartClinic" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script>
+      // Suppress Vite HMR WebSocket errors in AI Studio container/iframe environment
+      window.addEventListener('unhandledrejection', function (e) {
+        var msg = e && e.reason && (e.reason.message || String(e.reason));
+        if (msg && (msg.indexOf('WebSocket') !== -1 || msg.indexOf('websocket') !== -1)) {
+          e.preventDefault();
+        }
+      });
+    </script>
+    <style id="smartclinic-print-engine">
+      @media screen {
+        #smartclinic-print-mount,
+        #smartclinic-print-root {
+          display: none !important;
+          visibility: hidden !important;
+        }
+      }
+
+      @media print {
+        @page {
+          size: A4 portrait;
+          margin: 10mm 12mm;
+        }
+
+        html, body {
+          background-color: #ffffff !important;
+          background: #ffffff !important;
+          color: #0f172a !important;
+          width: 100% !important;
+          min-width: 100% !important;
+          max-width: 100% !important;
+          height: auto !important;
+          min-height: 100% !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          overflow: visible !important;
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+          color-scheme: light !important;
+        }
+
+        /* Suppress everything on the screen except the dedicated clinical print stationery */
+        #root,
+        .no-print,
+        .global-system-controls,
+        header,
+        aside,
+        nav,
+        main,
+        footer,
+        button,
+        [role="dialog"],
+        [role="status"],
+        [role="alert"],
+        .toast-viewport {
+          display: none !important;
+          visibility: hidden !important;
+          position: static !important;
+          height: 0 !important;
+          max-height: 0 !important;
+          width: 0 !important;
+          max-width: 0 !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          border: none !important;
+          overflow: hidden !important;
+          opacity: 0 !important;
+          pointer-events: none !important;
+        }
+
+        /* Display exclusively the pure clinical document stationery */
+        #smartclinic-print-mount,
+        #smartclinic-print-root {
+          display: block !important;
+          visibility: visible !important;
+          position: static !important;
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 100% !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          background: #ffffff !important;
+          background-color: #ffffff !important;
+          color: #0f172a !important;
+          box-shadow: none !important;
+          border: none !important;
+          border-radius: 0 !important;
+          overflow: visible !important;
+        }
+
+        #smartclinic-print-mount *,
+        #smartclinic-print-root * {
+          visibility: visible !important;
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+        }
+      }
+    </style>
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased selection:bg-teal-500 selection:text-white">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

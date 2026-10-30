@@ -1,0 +1,6 @@
+{
+  "name": "SmartClinic",
+  "description": "SmartClinic: A Role-Based Web Application Integrating Predictive Analysis for Healthcare Management — outpatient scheduling, real-time queue notifications, EMR, and monthly predictive analytics.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
