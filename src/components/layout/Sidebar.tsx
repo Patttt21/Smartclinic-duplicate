@@ -96,10 +96,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen = false, onClose }) => 
     },
     {
       id: 'queue',
-      label: t.nav.queue,
+      label: activeRole === 'patient' ? 'Walk-In Queue Status' : 'Walk-In Queue & Intake',
       icon: Layers,
       badge: waitingCount > 0 ? waitingCount : undefined,
-      roles: ['patient', 'doctor', 'nurse', 'receptionist'],
+      roles: ['patient', 'nurse', 'receptionist'],
       permissionKey: 'queue',
     },
     {
@@ -133,7 +133,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen = false, onClose }) => 
     },
     {
       id: 'inventory',
-      label: t.nav.inventory,
+      label: activeRole === 'doctor' ? 'Medicine Availability' : t.nav.inventory,
       icon: PackageCheck,
       badge: lowStockCount > 0 ? lowStockCount : undefined,
       roles: ['pharmacist', 'doctor', 'admin'],
@@ -157,8 +157,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen = false, onClose }) => 
       id: 'predictive-analytics',
       label: t.nav.predictiveAnalytics,
       icon: TrendingUp,
-      roles: ['admin'],
-      permissionKey: 'reports',
+      roles: ['admin', 'doctor', 'nurse', 'receptionist'],
+      permissionKey: 'predictiveAnalytics',
     },
     {
       id: 'audit-logs',
@@ -225,7 +225,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen = false, onClose }) => 
             <span>Security & Privacy Scope</span>
           </span>
           <span className="text-[9px] font-mono bg-teal-950/80 text-teal-300 px-1.5 py-0.5 rounded border border-teal-800/60">
-            RA 10173
+            RBAC Scope
           </span>
         </div>
         <p className="text-[10px] text-slate-400 leading-tight">

@@ -1,7 +1,6 @@
 /**
  * Smart Clinic — Full-Stack Server Application
- * Fully aligned with Philippine Health Data Security Standards (RA 10173).
- * Complete patient data isolation, RBAC token authentication, and real SMTP / Twilio integrations.
+ * Enforces verified RBAC token authentication, patient tenant isolation, and real SMTP / Twilio integrations.
  */
 import express, { Request, Response } from 'express';
 import fs from 'fs';
@@ -39,15 +38,21 @@ import {
 import {
   generateToken,
   authMiddleware,
+  requireVerifiedAuth,
+  requireVerifiedRoles,
+  requireAdmin,
   enforcePatientIsolation,
   touchServerSession,
   revokeServerSession,
   getRoleTimeoutSeconds,
+  setGlobalInactivityTimeoutSeconds,
+  DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
   type AuthenticatedRequest,
 } from './server/services/authService';
 import {
   emitToPatient,
   emitToStaffAndAdmin,
+  emitToSpecificUser,
   disconnectUserSockets,
   getVapidPublicKey,
   subscribeUserPush,
@@ -64,12 +69,31 @@ import {
   INITIAL_PRESCRIPTIONS,
   INITIAL_LAB_ORDERS,
   INITIAL_INVENTORY,
+  INITIAL_INVENTORY_TRANSACTIONS,
+  INITIAL_RESTOCK_REQUESTS,
   INITIAL_INVOICES,
   INITIAL_AUDIT_LOGS,
   INITIAL_NOTIFICATIONS,
 } from './data/mockData';
 import { getHistoricalSyntheticDataset } from './data/historicalSyntheticData';
-import type { Notification, User, UserRole, AuditLog, Appointment, ClinicBranch } from './types/clinic';
+import type {
+  Notification,
+  User,
+  UserRole,
+  AuditLog,
+  Appointment,
+  ClinicBranch,
+  ConsultationMode,
+  Vitals,
+  VitalsSource,
+  LabTestOrder,
+  LabOrderStatus,
+  InventoryTransaction,
+  RestockRequest,
+  NotificationPreferences,
+  ReminderDeliveryLog,
+  ClinicOperationalSettings,
+} from './types/clinic';
 import { validatePasswordStrength } from './utils/passwordValidation';
 import { createCustomDoctorSchedule, DOCTOR_SCHEDULES, getDoctorSchedule } from './utils/doctorSchedules';
 import {
@@ -78,9 +102,25 @@ import {
   canPatientRebookOnDate,
   validateAppointmentSlotBooking,
   evaluateWalkInCapacity,
+  validatePatientBookingDateManila,
+  isAppointmentEligibleForNoShow,
+  DEFAULT_NO_SHOW_GRACE_MINUTES,
 } from './utils/schedulingRules';
+import { matchSpecialtiesForReason, isDoctorOfferedAtBranch } from './utils/specialtyMatcher';
+import {
+  generateBookingReference,
+  generateAppointmentQrToken,
+  verifyQrTokenBinding,
+  buildNonPhiQrPayloadString,
+  parseScannedQrInput,
+} from './server/services/qrTokenService';
+import {
+  getDefaultNotificationPreferences,
+  dispatchAppointmentEventNotification,
+  evaluateDueAppointmentReminders,
+} from './server/services/appointmentReminderService';
 import { generatePredictiveAnalyticsReport } from './utils/monthlyForecasting';
-import { formatManilaDateTime } from './utils/manilaTime';
+import { formatManilaDateTime, getManilaDateString } from './utils/manilaTime';
 
 dotenv.config();
 
@@ -134,6 +174,14 @@ const API_PREFIXES = [
   '/health',
   '/status',
   '/gateway',
+  '/teleconsult',
+  '/settings',
+  '/reminders',
+  '/cron',
+  '/specialties',
+  '/departments',
+  '/system-accounts',
+  '/database',
 ];
 
 app.use((req, _res, next) => {
@@ -175,7 +223,7 @@ app.get(['/api', '/api/'], (_req: Request, res: Response) => {
     status: 'online',
     version: '3.4.0',
     health: '/api/health',
-    standards: 'RA 10173 Compliant',
+    securityModel: 'Role-Based Access Control & Tenant Isolation',
   });
 });
 
@@ -192,10 +240,75 @@ let memConsultations = [...INITIAL_CONSULTATIONS];
 let memPrescriptions = [...INITIAL_PRESCRIPTIONS];
 let memLabOrders = [...INITIAL_LAB_ORDERS];
 let memInventory = [...INITIAL_INVENTORY];
+let memInventoryTransactions: InventoryTransaction[] = [...INITIAL_INVENTORY_TRANSACTIONS];
+let memRestockRequests: RestockRequest[] = [...INITIAL_RESTOCK_REQUESTS];
 let memInvoices = [...INITIAL_INVOICES];
 let memAuditLogs = [...INITIAL_AUDIT_LOGS];
 let memNotifications = [...INITIAL_NOTIFICATIONS];
 let memUsers: User[] = [...INITIAL_USERS];
+let memReminderLogs: ReminderDeliveryLog[] = [];
+const memNotificationPreferences = new Map<string, NotificationPreferences>();
+let memClinicSettings: ClinicOperationalSettings = {
+  noShowGraceMinutes: DEFAULT_NO_SHOW_GRACE_MINUTES,
+  inactivityTimeoutSeconds: DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
+  inactivityWarningSeconds: 60,
+  allowOnlineConsultations: true,
+  defaultReminder24h: true,
+  defaultReminder2h: false,
+  updatedAt: new Date().toISOString(),
+  updatedBy: 'System Default',
+};
+
+interface TeleconsultSignalItem {
+  seq: number;
+  senderId: string;
+  senderRole: 'patient' | 'doctor';
+  type: 'offer' | 'answer' | 'ice-candidate' | 'peer-ready' | 'peer-left' | 'media-state';
+  payload: unknown;
+  createdAt: string;
+}
+
+interface TeleconsultRoomState {
+  appointmentId: string;
+  roomId: string;
+  patientJoinedAt?: string;
+  doctorJoinedAt?: string;
+  patientOnline: boolean;
+  doctorOnline: boolean;
+  status: 'Scheduled' | 'Waiting' | 'Active' | 'Ended';
+  startedAt?: string;
+  endedAt?: string;
+  seqCounter: number;
+  signals: TeleconsultSignalItem[];
+}
+
+const memTeleconsultRooms = new Map<string, TeleconsultRoomState>();
+
+function normalizeAppointmentForV2(a: Appointment): Appointment {
+  const isWalkIn = Boolean(a.isWalkIn || a.type === 'Walk-In');
+  const bookingReference = !isWalkIn
+    ? a.bookingReference || generateBookingReference(a.date)
+    : undefined;
+  const qrToken = !isWalkIn && bookingReference
+    ? a.qrToken || generateAppointmentQrToken(a.id, bookingReference)
+    : undefined;
+  const consultationMode: ConsultationMode =
+    a.consultationMode || (a.type === 'Online Consultation' || a.type === 'Telehealth' ? 'Online Consultation' : 'In-Person');
+  return {
+    ...a,
+    isWalkIn,
+    bookingReference,
+    qrToken,
+    consultationMode,
+    queueNumber: isWalkIn ? a.queueNumber : undefined,
+    teleconsultRoomId:
+      !isWalkIn && consultationMode === 'Online Consultation'
+        ? a.teleconsultRoomId || `tc-${a.id}`
+        : a.teleconsultRoomId,
+  };
+}
+
+memAppointments = memAppointments.map(normalizeAppointmentForV2);
 
 // Vercel Serverless State Persistence (/tmp/smart_clinic_data.json)
 const CLINIC_STATE_FILE = path.join('/tmp', 'smart_clinic_data.json');
@@ -206,14 +319,26 @@ function hydrateClinicStateFromDisk(): void {
       const raw = fs.readFileSync(CLINIC_STATE_FILE, 'utf-8');
       const data = JSON.parse(raw);
       if (Array.isArray(data.patients) && data.patients.length > 0) memPatients = data.patients;
-      if (Array.isArray(data.appointments)) memAppointments = data.appointments;
+      if (Array.isArray(data.appointments)) memAppointments = data.appointments.map(normalizeAppointmentForV2);
       if (Array.isArray(data.consultations)) memConsultations = data.consultations;
       if (Array.isArray(data.prescriptions)) memPrescriptions = data.prescriptions;
       if (Array.isArray(data.labOrders)) memLabOrders = data.labOrders;
       if (Array.isArray(data.inventory) && data.inventory.length > 0) memInventory = data.inventory;
+      if (Array.isArray(data.inventoryTransactions)) memInventoryTransactions = data.inventoryTransactions;
+      if (Array.isArray(data.restockRequests)) memRestockRequests = data.restockRequests;
       if (Array.isArray(data.invoices)) memInvoices = data.invoices;
       if (Array.isArray(data.auditLogs)) memAuditLogs = data.auditLogs;
       if (Array.isArray(data.notifications)) memNotifications = data.notifications;
+      if (Array.isArray(data.reminderLogs)) memReminderLogs = data.reminderLogs;
+      if (Array.isArray(data.notificationPreferences)) {
+        for (const pref of data.notificationPreferences) {
+          if (pref?.patientId) memNotificationPreferences.set(pref.patientId, pref);
+        }
+      }
+      if (data.clinicSettings && typeof data.clinicSettings === 'object') {
+        memClinicSettings = { ...memClinicSettings, ...data.clinicSettings };
+        setGlobalInactivityTimeoutSeconds(memClinicSettings.inactivityTimeoutSeconds);
+      }
       if (Array.isArray(data.users) && data.users.length > 0) {
         memUsers = data.users;
       }
@@ -229,7 +354,7 @@ function hydrateClinicStateFromDisk(): void {
       avatar: '',
       department: 'Executive Management',
       specialty: 'Healthcare Administration',
-      licenseNumber: 'PRC-0081294',
+      licenseNumber: 'DEMO-ADM-001',
       phone: '+63 917 800 1101',
     };
     memUsers = [...nonAdminUsers, canonicalAdmin];
@@ -247,9 +372,14 @@ export function flushClinicStateToDisk(): void {
       prescriptions: memPrescriptions,
       labOrders: memLabOrders,
       inventory: memInventory,
+      inventoryTransactions: memInventoryTransactions,
+      restockRequests: memRestockRequests,
       invoices: memInvoices,
       auditLogs: memAuditLogs,
       notifications: memNotifications,
+      reminderLogs: memReminderLogs,
+      notificationPreferences: Array.from(memNotificationPreferences.values()),
+      clinicSettings: memClinicSettings,
       users: memUsers,
       updatedAt: new Date().toISOString(),
     };
@@ -268,22 +398,30 @@ const twoFactorEnabledUsers = new Set<string>([
   'smartclinicrealacc@gmail.com',
 ]);
 
-// Supabase cloud integration check
+// Supabase cloud integration check (Server-side operations require SUPABASE_SERVICE_ROLE_KEY under hardened RLS)
 const supabaseUrl =
   process.env.SUPABASE_URL ||
   process.env.VITE_SUPABASE_URL ||
   '';
+const hasServiceRoleKey = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY);
 const supabaseKey =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
   process.env.SUPABASE_ANON_KEY ||
   process.env.VITE_SUPABASE_ANON_KEY ||
   '';
-const isSupabaseLive = Boolean(supabaseUrl && supabaseKey);
+if (supabaseUrl && supabaseKey && !hasServiceRoleKey) {
+  console.warn(
+    '[Smart Clinic Security] SUPABASE_SERVICE_ROLE_KEY is not set; anon keys have zero privileges on hardened SmartClinic V2 tables.'
+  );
+}
+const isSupabaseLive = Boolean(supabaseUrl && hasServiceRoleKey);
 export const supabaseServer: SupabaseClient | null = isSupabaseLive
-  ? createClient(supabaseUrl, supabaseKey)
+  ? createClient(supabaseUrl, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    })
   : null;
 
-// Connect authStore with Supabase for cross-instance state synchronization on Vercel
+// Connect authStore with Supabase only when service_role credentials are present
 authStore.setSupabaseClient(supabaseServer);
 
 export async function hydrateClinicStateFromSupabase(): Promise<boolean> {
@@ -664,7 +802,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
     aiModel: 'gemini-3.8-flash',
     database: isSupabaseLive ? 'supabase-live' : 'live-operational',
     otp: getOtpDeliveryStatus(),
-    dataSecurity: 'RA 10173 Compliant',
+    dataSecurity: 'RBAC & Tenant Isolation Active',
     uptime: Math.floor(process.uptime()),
   });
 });
@@ -673,12 +811,24 @@ app.get('/api/supabase/status', (_req: Request, res: Response) => {
   res.json({
     connected: isSupabaseLive,
     mode: isSupabaseLive ? 'live' : 'standby',
-    supabaseUrl: supabaseUrl || '',
+    hasServiceRoleKey,
     hasKey: Boolean(supabaseKey),
   });
 });
 
-app.get('/api/supabase/verify', async (_req: Request, res: Response) => {
+function isAllowedSupabaseVerifyUrl(rawUrl?: string): boolean {
+  if (!rawUrl) return true;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'https:') return false;
+    const host = parsed.hostname.toLowerCase();
+    return host.endsWith('.supabase.co') || host.endsWith('.supabase.in');
+  } catch {
+    return false;
+  }
+}
+
+app.get('/api/supabase/verify', requireAdmin, async (_req: AuthenticatedRequest, res: Response) => {
   try {
     const { runFullDatabaseVerification } = await import('../scripts/verify-database');
     const result = await runFullDatabaseVerification();
@@ -688,10 +838,15 @@ app.get('/api/supabase/verify', async (_req: Request, res: Response) => {
   }
 });
 
-app.post('/api/supabase/verify', async (req: Request, res: Response) => {
+app.post('/api/supabase/verify', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { runFullDatabaseVerification } = await import('../scripts/verify-database');
     const { supabaseUrl: targetUrl, supabaseKey: targetKey } = req.body || {};
+    if (targetUrl && !isAllowedSupabaseVerifyUrl(String(targetUrl))) {
+      return res.status(400).json({
+        error: 'Invalid Supabase project URL. Only https://<project-ref>.supabase.co endpoints are permitted.',
+      });
+    }
+    const { runFullDatabaseVerification } = await import('../scripts/verify-database');
     const result = await runFullDatabaseVerification(targetUrl, targetKey);
     return res.json(result);
   } catch (err: any) {
@@ -699,7 +854,7 @@ app.post('/api/supabase/verify', async (req: Request, res: Response) => {
   }
 });
 
-app.all('/api/database/repair', async (_req: Request, res: Response) => {
+app.all('/api/database/repair', requireAdmin, async (_req: AuthenticatedRequest, res: Response) => {
   try {
     const { repairAndHealDatabase } = await import('../scripts/repair-database');
     const result = await repairAndHealDatabase();
@@ -708,6 +863,31 @@ app.all('/api/database/repair', async (_req: Request, res: Response) => {
     return res.status(500).json({ error: err?.message || 'Database repair failed' });
   }
 });
+
+function formatPatientForSupabase(p: any) {
+  return {
+    id: p.id,
+    mrn: p.mrn,
+    full_name: p.fullName,
+    dob: p.dob,
+    age: p.age,
+    gender: p.gender,
+    blood_type: p.bloodType,
+    phone: p.phone,
+    email: p.email,
+    address: p.address,
+    emergency_contact: p.emergencyContact,
+    allergies: p.allergies || [],
+    chronic_conditions: p.chronicConditions || [],
+    current_medications: p.currentMedications || [],
+    primary_doctor_id: p.primaryDoctorId || null,
+    insurance_provider: p.insuranceProvider || null,
+    insurance_policy_number: p.insurancePolicyNumber || null,
+    vitals_history: p.vitalsHistory || [],
+    triage_history: p.triageHistory || [],
+    tags: p.tags || [],
+  };
+}
 
 async function syncAllClinicDataToSupabase(data: {
   patients: any[];
@@ -742,28 +922,7 @@ async function syncAllClinicDataToSupabase(data: {
 
     // 2. Patients
     if (data.patients.length) {
-      const formattedPatients = data.patients.map((p) => ({
-        id: p.id,
-        mrn: p.mrn,
-        full_name: p.fullName,
-        dob: p.dob,
-        age: p.age,
-        gender: p.gender,
-        blood_type: p.bloodType,
-        phone: p.phone,
-        email: p.email,
-        address: p.address,
-        emergency_contact: p.emergencyContact,
-        allergies: p.allergies,
-        chronic_conditions: p.chronicConditions,
-        current_medications: p.currentMedications,
-        primary_doctor_id: p.primaryDoctorId || null,
-        insurance_provider: p.insuranceProvider,
-        insurance_policy_number: p.insurancePolicyNumber,
-        vitals_history: p.vitalsHistory,
-        triage_history: p.triageHistory || [],
-        tags: p.tags,
-      }));
+      const formattedPatients = data.patients.map(formatPatientForSupabase);
       await supabaseServer.from('patients').upsert(formattedPatients, { onConflict: 'id' });
     }
 
@@ -989,17 +1148,63 @@ async function syncAllClinicDataToSupabase(data: {
   }
 }
 
-app.post('/api/clinic/seed', async (_req: Request, res: Response) => {
+app.post('/api/supabase/sync', requireAdmin, async (_req: AuthenticatedRequest, res: Response) => {
+  if (!supabaseServer) {
+    return res.status(400).json({
+      success: false,
+      syncedCounts: {},
+      message: 'Server SUPABASE_SERVICE_ROLE_KEY is not configured. Configure server-side credentials to synchronize records under hardened RLS.',
+    });
+  }
+  try {
+    await syncAllClinicDataToSupabase({
+      patients: memPatients,
+      appointments: memAppointments,
+      consultations: memConsultations,
+      prescriptions: memPrescriptions,
+      labOrders: memLabOrders,
+      inventory: memInventory,
+      invoices: memInvoices,
+      auditLogs: memAuditLogs,
+      users: memUsers,
+    });
+    return res.json({
+      success: true,
+      syncedCounts: {
+        patients: memPatients.length,
+        appointments: memAppointments.length,
+        consultations: memConsultations.length,
+        prescriptions: memPrescriptions.length,
+        labOrders: memLabOrders.length,
+        inventory: memInventory.length,
+        invoices: memInvoices.length,
+        auditLogs: memAuditLogs.length,
+      },
+      message: 'Successfully synchronized clinic records to Supabase via verified server-side service role.',
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      syncedCounts: {},
+      message: err?.message || 'Server-side Supabase sync failed.',
+    });
+  }
+});
+
+app.post('/api/clinic/seed', requireAdmin, async (_req: AuthenticatedRequest, res: Response) => {
   try {
     memPatients = [...INITIAL_PATIENTS];
-    memAppointments = [...INITIAL_APPOINTMENTS];
+    memAppointments = [...INITIAL_APPOINTMENTS].map(normalizeAppointmentForV2);
     memConsultations = [...INITIAL_CONSULTATIONS];
     memPrescriptions = [...INITIAL_PRESCRIPTIONS];
     memLabOrders = [...INITIAL_LAB_ORDERS];
     memInventory = [...INITIAL_INVENTORY];
+    memInventoryTransactions = [...INITIAL_INVENTORY_TRANSACTIONS];
+    memRestockRequests = [...INITIAL_RESTOCK_REQUESTS];
     memInvoices = [...INITIAL_INVOICES];
     memAuditLogs = [...INITIAL_AUDIT_LOGS];
     memNotifications = [...INITIAL_NOTIFICATIONS];
+    memReminderLogs = [];
     memUsers = [...INITIAL_USERS];
 
     flushClinicStateToDisk();
@@ -1019,7 +1224,7 @@ app.post('/api/clinic/seed', async (_req: Request, res: Response) => {
 
     return res.json({
       success: true,
-      message: 'Clinic database successfully reseeded with synthetic production records.',
+      message: 'Clinic database successfully reseeded with synthetic demonstration records.',
       counts: {
         patients: memPatients.length,
         appointments: memAppointments.length,
@@ -1043,7 +1248,7 @@ app.get('/api/auth/otp/status', (_req: Request, res: Response) => {
   res.json({ success: true, ...getOtpDeliveryStatus() });
 });
 
-app.post('/api/auth/otp/configure', async (req: Request, res: Response) => {
+app.post('/api/auth/otp/configure', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { smtpHost, smtpPort, smtpUser, smtpPass, smtpFrom, twilioSid, twilioToken, twilioFromNumber } = req.body || {};
 
@@ -1080,7 +1285,7 @@ app.post('/api/auth/otp/configure', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/auth/otp/test-email', async (req: Request, res: Response) => {
+app.post('/api/auth/otp/test-email', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const email = String(req.body?.email || '').trim();
     if (!email || !email.includes('@')) {
@@ -1383,6 +1588,15 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
     memPatients.unshift(newPatient);
     flushClinicStateToDisk();
 
+    if (supabaseServer) {
+      supabaseServer
+        .from('patients')
+        .upsert(formatPatientForSupabase(newPatient), { onConflict: 'id' })
+        .then(({ error }) => {
+          if (error) console.warn('Supabase patient registration sync notice:', error.message);
+        });
+    }
+
     // Cryptographic PBKDF2 Password Hashing with Salt
     if (cleanEmail && password) {
       registerUserCredentials(cleanEmail, String(password), 'patient');
@@ -1456,6 +1670,20 @@ app.post('/api/auth/verify-registration', async (req: Request, res: Response) =>
     };
 
     memPatients.unshift(newPatient);
+    flushClinicStateToDisk();
+
+    if (cleanEmail && password) {
+      registerUserCredentials(cleanEmail, String(password), 'patient');
+    }
+
+    if (supabaseServer) {
+      supabaseServer
+        .from('patients')
+        .upsert(formatPatientForSupabase(newPatient), { onConflict: 'id' })
+        .then(({ error }) => {
+          if (error) console.warn('Supabase OTP registration sync notice:', error.message);
+        });
+    }
 
     // Asynchronously dispatch Welcome Email and Welcome SMS
     if (cleanEmail) {
@@ -1631,7 +1859,7 @@ app.post('/api/auth/password-reset/confirm', async (req: Request, res: Response)
           <div style="font-family: sans-serif; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px;">
             <h3 style="color: #0d9488; margin-top: 0;">Password Successfully Updated</h3>
             <p style="color: #475569; font-size: 13px;">Your Smart Clinic account credentials have been securely updated. You may now sign in using your new password.</p>
-            <p style="color: #94a3b8; font-size: 11px;">Philippine Health Data Security (RA 10173)</p>
+            <p style="color: #94a3b8; font-size: 11px;">SmartClinic Account Security Notification</p>
           </div>
         `,
         purpose: 'password_changed_alert',
@@ -1653,8 +1881,8 @@ app.post('/api/auth/password-reset/confirm', async (req: Request, res: Response)
   }
 });
 
-// Communication Audit Logs
-app.get('/api/communication/logs', (_req: Request, res: Response) => {
+// Communication Audit Logs (Administrator Only)
+app.get('/api/communication/logs', requireAdmin, (_req: AuthenticatedRequest, res: Response) => {
   res.json({
     success: true,
     logs: verificationService.getAllCommunicationLogs(),
@@ -1683,7 +1911,20 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
       if (method === 'authenticator') {
         const cleanEmail = String(email || '').trim().toLowerCase();
         const code = String(twoFactorCode || req.body?.otpCode || '').trim();
-        const secret = getUserTotpSecret(cleanEmail || 'patient@smartclinic.ph');
+        if (!cleanEmail || !code) {
+          return res.status(400).json({
+            success: false,
+            error: 'Registered email address and 6-digit Authenticator code are required.',
+          });
+        }
+        patient = memPatients.find((p) => p.email.toLowerCase() === cleanEmail) || null;
+        if (!patient) {
+          return res.status(401).json({
+            success: false,
+            error: 'No registered patient account found for this email address.',
+          });
+        }
+        const secret = getUserTotpSecret(cleanEmail);
         const valid = verifyTotpCode(secret, code);
         if (!valid) {
           return res.status(401).json({
@@ -1691,141 +1932,80 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
             error: 'Invalid Authenticator code. Check the rolling 6-digit code in your Authenticator app.',
           });
         }
-        patient = memPatients.find((p) => p.email.toLowerCase() === cleanEmail) || null;
-        if (!patient) {
-          const mrn = `MRN-2026-${String(memPatients.length + 101).padStart(3, '0')}`;
-          patient = {
-            id: `pat-${Date.now()}`,
-            mrn,
-            fullName: req.body?.fullName || cleanEmail.split('@')[0] || 'Verified Patient',
-            dob: '1990-01-01',
-            age: 34,
-            gender: 'Other' as const,
-            bloodType: 'O+' as const,
-            phone: '+63 900 000 0000',
-            email: cleanEmail,
-            address: 'Metro Manila, Philippines',
-            emergencyContact: { name: 'Emergency Contact', relationship: 'Self', phone: '+63 900 000 0000' },
-            allergies: [],
-            chronicConditions: [],
-            currentMedications: [],
-            primaryDoctorId: 'usr-1',
-            createdAt: new Date().toISOString(),
-            vitalsHistory: [],
-          };
-          memPatients.unshift(patient);
-        }
       } else if (method === 'phone') {
         const cleanPhone = String(phone || email || '').replace(/\D/g, '');
+        const otpCode = String(twoFactorCode || req.body?.otpCode || '').trim();
+        if (!cleanPhone || !otpCode) {
+          return res.status(400).json({
+            success: false,
+            error: 'Mobile phone number and SMS verification code are required.',
+          });
+        }
         const otpResult = await verificationService.verifyOtp({
           channel: 'sms',
           destination: cleanPhone,
-          code: String(twoFactorCode || req.body?.otpCode || '').trim(),
+          code: otpCode,
         });
         if (!otpResult.success) {
           return res.status(401).json({ success: false, error: otpResult.error || 'Invalid SMS OTP.' });
         }
         patient = memPatients.find((p) => p.phone.replace(/\D/g, '').includes(cleanPhone)) || null;
         if (!patient) {
-          // Auto-provision patient record for verified phone
-          const mrn = `MRN-2026-${String(memPatients.length + 101).padStart(3, '0')}`;
-          patient = {
-            id: `pat-${Date.now()}`,
-            mrn,
-            fullName: req.body?.fullName || `Patient ${cleanPhone.slice(-4)}`,
-            dob: '1990-01-01',
-            age: 34,
-            gender: 'Other' as const,
-            bloodType: 'O+' as const,
-            phone: `+${cleanPhone}`,
-            email: `${cleanPhone}@phone.smartclinic.local`,
-            address: 'Metro Manila, Philippines',
-            emergencyContact: { name: 'Emergency Contact', relationship: 'Family', phone: `+${cleanPhone}` },
-            allergies: [],
-            chronicConditions: [],
-            currentMedications: [],
-            primaryDoctorId: 'usr-1',
-            createdAt: new Date().toISOString(),
-            vitalsHistory: [],
-          };
-          memPatients.unshift(patient);
+          return res.status(401).json({
+            success: false,
+            error: 'No registered patient account found for this mobile number. Please register first.',
+          });
+        }
+      } else if (method === 'email_otp') {
+        const cleanEmail = String(email || '').trim().toLowerCase();
+        const otpCode = String(twoFactorCode || req.body?.otpCode || '').trim();
+        if (!cleanEmail || !otpCode) {
+          return res.status(400).json({
+            success: false,
+            error: 'Registered email address and verification code are required.',
+          });
+        }
+        const otpResult = await verificationService.verifyOtp({
+          channel: 'email',
+          destination: cleanEmail,
+          code: otpCode,
+        });
+        if (!otpResult.success) {
+          return res.status(401).json({ success: false, error: otpResult.error || 'Invalid email verification code.' });
+        }
+        patient = memPatients.find((p) => p.email.toLowerCase() === cleanEmail) || null;
+        if (!patient) {
+          return res.status(401).json({
+            success: false,
+            error: 'No registered patient account found for this email address. Please register first.',
+          });
         }
       } else {
-        // Email + OTP or Email + Password
+        // Default: Email + Password (mandatory — never skip password verification)
         const cleanEmail = String(email || '').trim().toLowerCase();
-
-        // 1. Check account lockout & verify password using PBKDF2 salted cryptographic hashes
-        if (password) {
-          const pwCheck = await verifyUserPassword(cleanEmail, String(password));
-          if (!pwCheck.success) {
-            return res.status(pwCheck.isLocked ? 429 : 401).json({
-              success: false,
-              error: pwCheck.error || 'Invalid email or password.',
-              remainingAttempts: pwCheck.remainingAttempts,
-            });
-          }
+        const rawPass = typeof password === 'string' ? password : '';
+        if (!cleanEmail || !rawPass) {
+          return res.status(400).json({
+            success: false,
+            error: 'Email address and account password are both required.',
+          });
         }
 
-        // 2. Authenticator App 2FA Enforcement (Exempt for patient role per requirements)
-        const has2Fa = twoFactorEnabledUsers.has(cleanEmail);
-        const codeToVerify = String(twoFactorCode || req.body?.otpCode || '').trim();
-
-        if (has2Fa && primaryRole !== 'patient') {
-          if (!codeToVerify) {
-            return res.status(200).json({
-              success: false,
-              requires2FA: true,
-              twoFactorRequired: true,
-              method: 'authenticator',
-              email: cleanEmail,
-              message: 'Authenticator App (2FA) is enabled for this account. Enter the 6-digit code from your Authenticator app.',
-            });
-          }
-
-          // Strictly verify RFC 6238 TOTP from Authenticator app — DO NOT treat as normal email verification!
-          const secret = getUserTotpSecret(cleanEmail);
-          const isTotp = verifyTotpCode(secret, codeToVerify);
-          if (!isTotp) {
-            return res.status(401).json({
-              success: false,
-              error: 'Invalid Authenticator code. Check the rolling 6-digit code in your Authenticator app (e.g. Google Authenticator).',
-            });
-          }
-        } else if (codeToVerify && primaryRole !== 'patient') {
-          const secret = getUserTotpSecret(cleanEmail);
-          const isTotp = verifyTotpCode(secret, codeToVerify);
-          if (!isTotp) {
-            return res.status(401).json({
-              success: false,
-              error: 'Invalid Authenticator code. Check the rolling 6-digit code in your Authenticator app.',
-            });
-          }
+        const pwCheck = await verifyUserPassword(cleanEmail, rawPass);
+        if (!pwCheck.success) {
+          return res.status(pwCheck.isLocked ? 429 : 401).json({
+            success: false,
+            error: pwCheck.error || 'Invalid email or password.',
+            remainingAttempts: pwCheck.remainingAttempts,
+          });
         }
-        patient = memPatients.find((p) => p.email.toLowerCase() === cleanEmail) ||
-          (cleanEmail.includes('elena') ? memPatients.find((p) => p.fullName.toLowerCase().includes('elena') || p.email.toLowerCase().includes('elena')) : null) ||
-          null;
+
+        patient = memPatients.find((p) => p.email.toLowerCase() === cleanEmail) || null;
         if (!patient) {
-          const mrn = `MRN-2026-${String(memPatients.length + 101).padStart(3, '0')}`;
-          patient = {
-            id: `pat-${Date.now()}`,
-            mrn,
-            fullName: req.body?.fullName || cleanEmail.split('@')[0],
-            dob: '1990-01-01',
-            age: 34,
-            gender: 'Other' as const,
-            bloodType: 'O+' as const,
-            phone: '+639170000000',
-            email: cleanEmail,
-            address: 'Metro Manila, Philippines',
-            emergencyContact: { name: 'Emergency Contact', relationship: 'Family', phone: '+639170000000' },
-            allergies: [],
-            chronicConditions: [],
-            currentMedications: [],
-            primaryDoctorId: 'usr-1',
-            createdAt: new Date().toISOString(),
-            vitalsHistory: [],
-          };
-          memPatients.unshift(patient);
+          return res.status(401).json({
+            success: false,
+            error: 'Invalid email or password.',
+          });
         }
       }
 
@@ -1838,7 +2018,6 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
         linkedPatientId: patient.id,
       });
 
-      // Asynchronous security login notifications
       if (patient.email && patient.email.includes('@') && !patient.email.includes('local')) {
         emailService.sendLoginAlert(patient.email, { device: String(req.headers['user-agent'] || 'Web Client') }).catch(console.error);
       }
@@ -1854,22 +2033,32 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
       });
     }
 
-    // 2. DOCTOR AUTHENTICATION
+    // 2. DOCTOR AUTHENTICATION (Strict identity + mandatory password)
     if (primaryRole === 'doctor') {
       const cleanEmail = String(email || '').trim().toLowerCase();
-      const doctor = memUsers.find((u) => u.role === 'doctor' && u.email.toLowerCase() === cleanEmail) ||
-        memUsers.find((u) => u.role === 'doctor' && (cleanEmail.includes('doctor') || cleanEmail.includes('reyes') || cleanEmail.includes('santos'))) ||
-        memUsers.find((u) => u.role === 'doctor') || INITIAL_USERS[0];
+      const rawPass = typeof password === 'string' ? password : '';
+      if (!cleanEmail || !rawPass) {
+        return res.status(400).json({
+          success: false,
+          error: 'Physician work email and password are required.',
+        });
+      }
 
-      if (password) {
-        const pwCheck = await verifyUserPassword(doctor.email, String(password));
-        if (!pwCheck.success) {
-          return res.status(pwCheck.isLocked ? 429 : 401).json({
-            success: false,
-            error: pwCheck.error || 'Doctor credentials failed.',
-            remainingAttempts: pwCheck.remainingAttempts,
-          });
-        }
+      const doctor = memUsers.find((u) => u.role === 'doctor' && u.email.toLowerCase() === cleanEmail);
+      if (!doctor) {
+        return res.status(401).json({
+          success: false,
+          error: 'Invalid physician credentials.',
+        });
+      }
+
+      const pwCheck = await verifyUserPassword(doctor.email, rawPass);
+      if (!pwCheck.success) {
+        return res.status(pwCheck.isLocked ? 429 : 401).json({
+          success: false,
+          error: pwCheck.error || 'Doctor credentials failed.',
+          remainingAttempts: pwCheck.remainingAttempts,
+        });
       }
 
       if (twoFactorEnabledUsers.has(cleanEmail)) {
@@ -1910,7 +2099,7 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
       });
     }
 
-    // 3. STAFF AUTHENTICATION (Strictly excludes Doctor and Admin)
+    // 3. STAFF AUTHENTICATION (Strict role match + mandatory password — blocks cross-role escalation)
     if (primaryRole === 'staff') {
       const allowedSubRoles = ['nurse', 'pharmacist', 'receptionist', 'lab_technician'];
       if (!subRole || !allowedSubRoles.includes(subRole)) {
@@ -1921,22 +2110,53 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
       }
 
       const cleanEmail = String(email || '').trim().toLowerCase();
-      const staffUser = (cleanEmail && memUsers.find((u) => u.email.toLowerCase() === cleanEmail)) ||
-        memUsers.find((u) => u.role === subRole || (u as any).subRole === subRole) ||
-        INITIAL_USERS.find((u) => u.role === subRole) || {
-          id: `usr-${subRole}`,
-          name: `${subRole.replace('_', ' ').toUpperCase()} Practitioner`,
-          email: `${subRole}@smartclinic.ph`,
-          role: subRole as any,
-        };
+      const rawPass = typeof password === 'string' ? password : '';
+      if (!cleanEmail || !rawPass) {
+        return res.status(400).json({
+          success: false,
+          error: 'Staff work email and password are required.',
+        });
+      }
 
-      if (password) {
-        const pwCheck = await verifyUserPassword(staffUser.email, String(password));
-        if (!pwCheck.success) {
-          return res.status(pwCheck.isLocked ? 429 : 401).json({
+      const staffUser = memUsers.find(
+        (u) =>
+          u.email.toLowerCase() === cleanEmail &&
+          (u.role === subRole || (u.role === ('staff' as any) && (u as any).subRole === subRole))
+      );
+      if (!staffUser) {
+        return res.status(401).json({
+          success: false,
+          error: 'Invalid clinic staff credentials or unauthorized role selection.',
+        });
+      }
+
+      const pwCheck = await verifyUserPassword(staffUser.email, rawPass);
+      if (!pwCheck.success) {
+        return res.status(pwCheck.isLocked ? 429 : 401).json({
+          success: false,
+          error: pwCheck.error || 'Staff credentials failed.',
+          remainingAttempts: pwCheck.remainingAttempts,
+        });
+      }
+
+      if (twoFactorEnabledUsers.has(cleanEmail)) {
+        const codeToVerify = String(twoFactorCode || req.body?.otpCode || '').trim();
+        if (!codeToVerify) {
+          return res.status(200).json({
             success: false,
-            error: pwCheck.error || 'Staff credentials failed.',
-            remainingAttempts: pwCheck.remainingAttempts,
+            requires2FA: true,
+            twoFactorRequired: true,
+            method: 'authenticator',
+            email: cleanEmail,
+            message: 'Authenticator App (2FA) is enabled for this staff account. Enter the 6-digit code from your Authenticator app.',
+          });
+        }
+        const secret = getUserTotpSecret(cleanEmail);
+        const isTotp = verifyTotpCode(secret, codeToVerify);
+        if (!isTotp) {
+          return res.status(401).json({
+            success: false,
+            error: 'Invalid Authenticator code. Check the rolling 6-digit code in your Authenticator app.',
           });
         }
       }
@@ -1958,9 +2178,10 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
       });
     }
 
-    // 4. ADMIN AUTHENTICATION (Mandatory 2FA Authenticator code)
+    // 4. ADMIN AUTHENTICATION (Mandatory password + Mandatory 2FA Authenticator code)
     if (primaryRole === 'admin') {
       const cleanEmail = String(email || '').trim().toLowerCase();
+      const rawPass = typeof password === 'string' ? password : '';
       const authorizedAdminEmails = [
         ADMIN_EMAIL.toLowerCase(),
         'smartclinicrealacc@gmail.com',
@@ -1972,15 +2193,20 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
         });
       }
 
-      if (password) {
-        const pwCheck = await verifyUserPassword(cleanEmail, String(password));
-        if (!pwCheck.success) {
-          return res.status(pwCheck.isLocked ? 429 : 401).json({
-            success: false,
-            error: pwCheck.error || 'Invalid administrator credentials.',
-            remainingAttempts: pwCheck.remainingAttempts,
-          });
-        }
+      if (!rawPass) {
+        return res.status(400).json({
+          success: false,
+          error: 'Administrator password is required.',
+        });
+      }
+
+      const pwCheck = await verifyUserPassword(cleanEmail, rawPass);
+      if (!pwCheck.success) {
+        return res.status(pwCheck.isLocked ? 429 : 401).json({
+          success: false,
+          error: pwCheck.error || 'Invalid administrator credentials.',
+          remainingAttempts: pwCheck.remainingAttempts,
+        });
       }
 
       // Mandatory Authenticator App 2FA code verification (RFC 6238 TOTP)
@@ -2012,7 +2238,7 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
           role: 'admin' as const,
           department: 'Executive Management',
           specialty: 'Healthcare Administration',
-          licenseNumber: 'PRC-0081294',
+          licenseNumber: 'DEMO-ADM-001',
           phone: '+63 917 800 1101',
         };
 
@@ -2025,7 +2251,6 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
         linkedPatientId: null,
       });
 
-      // Asynchronous admin login security notification
       emailService.sendLoginAlert(ADMIN_EMAIL, { device: String(req.headers['user-agent'] || 'Administrator Console') }).catch(console.error);
 
       return res.json({
@@ -2067,21 +2292,23 @@ app.post('/api/auth/heartbeat', (req: AuthenticatedRequest, res: Response) => {
   });
 });
 
-// Explicit Logout (Revokes Server Session + Unbinds Push Notifications & Active Sockets)
+// Explicit Logout (Revokes Server Session & Active Sockets while preserving consented appointment reminders unless revokePush=true)
 app.post('/api/auth/logout', (req: AuthenticatedRequest, res: Response) => {
   const userId = req.userId || req.user?.userId || req.body?.userId;
   const linkedPatientId = req.linkedPatientId || req.user?.linkedPatientId || req.body?.patientId || null;
 
   revokeServerSession(req.authToken, userId);
   if (userId) {
-    clearPushSubscriptionsForUser(userId, linkedPatientId);
+    if (req.body?.revokePush === true) {
+      clearPushSubscriptionsForUser(userId, linkedPatientId);
+    }
     disconnectUserSockets(userId, linkedPatientId);
   }
 
   return res.json({
     success: true,
     timeoutPolicySeconds: getRoleTimeoutSeconds(req.userRole),
-    message: 'Session terminated and device push bindings cleared.',
+    message: 'Session securely terminated. Scheduled appointment reminders remain governed by your notification preferences.',
   });
 });
 
@@ -2127,21 +2354,13 @@ app.post('/api/push/unsubscribe', (req: AuthenticatedRequest, res: Response) => 
   return res.json({ success: true, removed });
 });
 
-app.get('/api/analytics/monthly-forecast', (req: AuthenticatedRequest, res: Response) => {
-  const role = req.userRole || req.user?.role || 'admin';
-  if (role === 'patient') {
-    return res.status(403).json({
-      success: false,
-      error: 'Forbidden: Monthly Predictive Analytics is restricted to authorized clinic administration.',
-    });
-  }
-
-  const rawBranch = String(req.query.branch || 'ALL');
+function buildMonthlyForecastResponse(req: AuthenticatedRequest, res: Response) {
+  const rawBranch = String(req.query.branch || req.body?.branch || 'ALL');
   const branchFilter: 'ALL' | ClinicBranch =
     rawBranch === 'Main Outpatient Clinic' || rawBranch === 'Annex Satellite Clinic'
       ? rawBranch
       : 'ALL';
-  const horizonRaw = Number(req.query.horizon || 6);
+  const horizonRaw = Number(req.query.horizon || req.body?.horizon || 6);
   const horizonMonths: 3 | 6 = horizonRaw === 3 ? 3 : 6;
 
   const synthetic = getHistoricalSyntheticDataset();
@@ -2167,14 +2386,30 @@ app.get('/api/analytics/monthly-forecast', (req: AuthenticatedRequest, res: Resp
     success: true,
     report,
   });
-});
+}
+
+app.get(
+  '/api/analytics/monthly-forecast',
+  requireVerifiedRoles('admin', 'doctor', 'nurse', 'receptionist'),
+  buildMonthlyForecastResponse
+);
+
+app.post(
+  '/api/analytics/monthly-forecast/refresh',
+  requireVerifiedRoles('admin', 'doctor', 'nurse', 'receptionist'),
+  buildMonthlyForecastResponse
+);
 
 /* ==========================================================================
    DOCTORS & CLINICAL STAFF GOVERNANCE
    ========================================================================== */
-app.get('/api/users', (_req: Request, res: Response) => {
-  return res.json(memUsers);
-});
+app.get(
+  '/api/users',
+  requireVerifiedRoles('admin', 'doctor', 'nurse', 'receptionist', 'pharmacist', 'lab_technician'),
+  (_req: AuthenticatedRequest, res: Response) => {
+    return res.json(memUsers);
+  }
+);
 
 app.get(['/api/auth/system-accounts', '/api/system-accounts'], async (_req: Request, res: Response) => {
   if (supabaseServer) {
@@ -2192,7 +2427,7 @@ app.get(['/api/auth/system-accounts', '/api/system-accounts'], async (_req: Requ
     primaryRole: 'admin' as const,
     role: 'admin' as const,
     password: 'SmartClinic@Admin2026',
-    notes: 'Full administrative access, financial oversight, RA 10173 audit logs, Supabase integration. Requires Authenticator 2FA.',
+    notes: 'Full administrative access, financial oversight, system audit logs, Supabase integration. Requires Authenticator 2FA.',
     badge: 'Admin',
     badgeColor: 'bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800',
     requires2Fa: true,
@@ -2211,7 +2446,7 @@ app.get(['/api/auth/system-accounts', '/api/system-accounts'], async (_req: Requ
       primaryRole: 'doctor' as const,
       role: 'doctor' as const,
       password: 'doctor123',
-      notes: `Clinical SOAP consultations, e-prescribing, lab interpretations. License: ${d.licenseNumber || 'MD-PRC-Verified'}.`,
+      notes: `Clinical SOAP consultations, e-prescribing, lab interpretations. Demo ID: ${d.licenseNumber || 'DEMO-MD-000'}.`,
       badge: 'Doctor',
       badgeColor: 'bg-teal-100 dark:bg-teal-950 text-teal-700 dark:text-teal-300 border-teal-200 dark:border-teal-800',
       department: d.department,
@@ -2365,7 +2600,7 @@ app.get('/api/doctors', (_req: Request, res: Response) => {
   return res.json(doctors);
 });
 
-app.post('/api/doctors', (req: Request, res: Response) => {
+app.post('/api/doctors', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       name,
@@ -2411,7 +2646,13 @@ app.post('/api/doctors', (req: Request, res: Response) => {
       role: 'doctor',
       department: department || 'General Medicine',
       specialty: specialty || 'Internal & Family Medicine',
-      licenseNumber: licenseNumber || `MD-${Math.floor(100000 + Math.random() * 900000)}`,
+      licenseNumber: licenseNumber || `DEMO-MD-${Math.floor(100 + Math.random() * 900)}`,
+      branches: Array.isArray(req.body?.branches) && req.body.branches.length > 0
+        ? req.body.branches
+        : ['Main Outpatient Clinic'],
+      consultationModes: Array.isArray(req.body?.consultationModes) && req.body.consultationModes.length > 0
+        ? req.body.consultationModes
+        : ['In-Person', 'Online Consultation'],
       workDays: days,
       workDaysLabel: newSchedule.workDaysLabel,
       hoursLabel: newSchedule.hoursLabel,
@@ -2422,17 +2663,17 @@ app.post('/api/doctors', (req: Request, res: Response) => {
 
     memUsers.unshift(newDoctor);
 
-    // Record audit event
+    // Record audit event bound to verified administrator session
     const auditEntry: AuditLog = {
       id: `log-${Date.now()}`,
       action: 'DOCTOR_CREDENTIALED',
-      userId: 'usr-admin',
-      userName: 'Clinic Director',
+      userId: req.user?.userId || 'usr-admin',
+      userName: req.user?.name || 'Clinic Director',
       userRole: 'admin',
       resourceType: 'Security',
       resourceId: newDoctor.id,
       timestamp: new Date().toISOString(),
-      description: `New Physician Credentialed: ${cleanName} (${newDoctor.specialty}, PRC: ${newDoctor.licenseNumber}) under Philippine Medical Governance.`,
+      description: `New Physician Added: ${cleanName} (${newDoctor.specialty}, Demo Ref: ${newDoctor.licenseNumber}).`,
       ipAddress: String(req.ip || '127.0.0.1'),
     };
     memAuditLogs.unshift(auditEntry);
@@ -2527,7 +2768,7 @@ app.get('/api/specialties', async (_req: Request, res: Response) => {
   return res.json(Array.from(specialtyMap.values()));
 });
 
-app.patch('/api/doctors/:id/specialty', async (req: AuthenticatedRequest, res: Response) => {
+app.patch('/api/doctors/:id/specialty', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const { specialty, department } = req.body || {};
 
@@ -2558,43 +2799,84 @@ app.patch('/api/doctors/:id/specialty', async (req: AuthenticatedRequest, res: R
 });
 
 /* ==========================================================================
-   PATIENTS EMR (Strict Tenancy Isolation RA 10173)
+   PATIENTS EMR (Strict Role & Tenant Isolation)
    ========================================================================== */
-app.get('/api/patients', (req: AuthenticatedRequest, res: Response) => {
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+function sanitizeStaffPatientUpdates(updates: Record<string, any>): Record<string, any> {
+  const safe: Record<string, any> = { ...updates };
+  delete safe.id;
+  delete safe.role;
+  delete safe.subRole;
+  delete safe.sub_role;
+  delete safe.permissions;
+  delete safe.auth_user_id;
+  delete safe.authUserId;
+  return safe;
+}
 
-  if (isPatient && linkedId) {
+app.get('/api/patients', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  const isPatient = actorRole === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
+
+  if (isPatient) {
+    if (!linkedId) return res.json([]);
     return res.json(memPatients.filter((p) => p.id === linkedId));
+  }
+  if (!['admin', 'doctor', 'nurse', 'receptionist'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' is not authorized to read the patient registry.` });
   }
   return res.json(memPatients);
 });
 
-app.get('/api/patients/:id', enforcePatientIsolation, (req: AuthenticatedRequest, res: Response) => {
+app.get('/api/patients/:id', requireVerifiedAuth, enforcePatientIsolation, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  if (actorRole !== 'patient' && !['admin', 'doctor', 'nurse', 'receptionist'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' is not authorized to view patient charts.` });
+  }
   const patient = memPatients.find((p) => p.id === req.params.id);
   if (!patient) return res.status(404).json({ error: 'Patient not found.' });
   return res.json(patient);
 });
 
-app.post('/api/patients', (req: AuthenticatedRequest, res: Response) => {
-  const newPat = req.body;
-  if (!newPat.id) newPat.id = `pat-${Date.now()}`;
-  if (!newPat.mrn) newPat.mrn = `MRN-2026-${String(memPatients.length + 101).padStart(3, '0')}`;
-  newPat.createdAt = newPat.createdAt || new Date().toISOString();
-  memPatients.unshift(newPat);
-  flushClinicStateToDisk();
-  return res.status(201).json(newPat);
-});
+app.post(
+  '/api/patients',
+  requireVerifiedRoles('admin', 'doctor', 'nurse', 'receptionist'),
+  (req: AuthenticatedRequest, res: Response) => {
+    const newPat = sanitizeStaffPatientUpdates(req.body || {});
+    if (!newPat.id) newPat.id = `pat-${Date.now()}`;
+    if (!newPat.mrn) newPat.mrn = `MRN-2026-${String(memPatients.length + 101).padStart(3, '0')}`;
+    newPat.createdAt = newPat.createdAt || new Date().toISOString();
+    memPatients.unshift(newPat as any);
+    flushClinicStateToDisk();
 
-app.patch('/api/patients/:id', enforcePatientIsolation, (req: AuthenticatedRequest, res: Response) => {
+    if (supabaseServer) {
+      supabaseServer
+        .from('patients')
+        .upsert(formatPatientForSupabase(newPat), { onConflict: 'id' })
+        .then(({ error }) => {
+          if (error) console.warn('Supabase patient create sync notice:', error.message);
+        });
+    }
+
+    return res.status(201).json(newPat);
+  }
+);
+
+app.patch('/api/patients/:id', requireVerifiedAuth, enforcePatientIsolation, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  if (actorRole !== 'patient' && !['admin', 'doctor', 'nurse', 'receptionist'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' cannot modify patient profiles.` });
+  }
+
   const patientIdx = memPatients.findIndex((p) => p.id === req.params.id);
   if (patientIdx === -1) return res.status(404).json({ error: 'Patient not found.' });
 
   const updates = req.body || {};
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
+  const isPatient = actorRole === 'patient';
 
   if (isPatient) {
-    const allowed = ['fullName', 'email', 'phone', 'address', 'emergencyContact', 'bloodType', 'allergies', 'chronicConditions', 'avatar', 'dob', 'gender'];
+    // Prevent patients from modifying role, permissions, MRN, attending doctor, medications, triage, or clinical vitals
+    const allowed = ['fullName', 'phone', 'address', 'emergencyContact', 'bloodType', 'allergies', 'chronicConditions', 'avatar', 'dob', 'gender'];
     const safeUpdates: any = {};
     for (const key of allowed) {
       if (updates[key] !== undefined) {
@@ -2603,15 +2885,14 @@ app.patch('/api/patients/:id', enforcePatientIsolation, (req: AuthenticatedReque
     }
     memPatients[patientIdx] = { ...memPatients[patientIdx], ...safeUpdates };
 
-    // Also sync with memUsers if patient user exists
-    const userIdx = memUsers.findIndex((u) => u.id === req.params.id || u.email.toLowerCase() === memPatients[patientIdx].email.toLowerCase());
+    // Sync only non-privileged display fields (never role, subRole, email, or permissions)
+    const userIdx = memUsers.findIndex((u) => u.id === req.params.id && u.role === 'patient');
     if (userIdx !== -1) {
       if (safeUpdates.fullName) memUsers[userIdx].name = safeUpdates.fullName;
-      if (safeUpdates.email) memUsers[userIdx].email = safeUpdates.email;
       if (safeUpdates.avatar) memUsers[userIdx].avatar = safeUpdates.avatar;
     }
   } else {
-    memPatients[patientIdx] = { ...memPatients[patientIdx], ...updates };
+    memPatients[patientIdx] = { ...memPatients[patientIdx], ...sanitizeStaffPatientUpdates(updates) };
   }
 
   flushClinicStateToDisk();
@@ -2619,7 +2900,7 @@ app.patch('/api/patients/:id', enforcePatientIsolation, (req: AuthenticatedReque
   if (supabaseServer) {
     (async () => {
       try {
-        await supabaseServer.from('patients').upsert(memPatients[patientIdx]);
+        await supabaseServer.from('patients').upsert(formatPatientForSupabase(memPatients[patientIdx]), { onConflict: 'id' });
       } catch (err) {
         console.error('Supabase patient upsert error:', err);
       }
@@ -2629,15 +2910,20 @@ app.patch('/api/patients/:id', enforcePatientIsolation, (req: AuthenticatedReque
   return res.json({ success: true, message: 'Profile updated successfully', patient: memPatients[patientIdx] });
 });
 
-app.put('/api/patients/:id', enforcePatientIsolation, (req: AuthenticatedRequest, res: Response) => {
+app.put('/api/patients/:id', requireVerifiedAuth, enforcePatientIsolation, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  if (actorRole !== 'patient' && !['admin', 'doctor', 'nurse', 'receptionist'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' cannot modify patient profiles.` });
+  }
+
   const patientIdx = memPatients.findIndex((p) => p.id === req.params.id);
   if (patientIdx === -1) return res.status(404).json({ error: 'Patient not found.' });
 
   const updates = req.body || {};
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
+  const isPatient = actorRole === 'patient';
 
   if (isPatient) {
-    const allowed = ['fullName', 'email', 'phone', 'address', 'emergencyContact', 'bloodType', 'allergies', 'chronicConditions', 'avatar', 'dob', 'gender'];
+    const allowed = ['fullName', 'phone', 'address', 'emergencyContact', 'bloodType', 'allergies', 'chronicConditions', 'avatar', 'dob', 'gender'];
     const safeUpdates: any = {};
     for (const key of allowed) {
       if (updates[key] !== undefined) {
@@ -2646,42 +2932,21 @@ app.put('/api/patients/:id', enforcePatientIsolation, (req: AuthenticatedRequest
     }
     memPatients[patientIdx] = { ...memPatients[patientIdx], ...safeUpdates };
 
-    const userIdx = memUsers.findIndex((u) => u.id === req.params.id || u.email.toLowerCase() === memPatients[patientIdx].email.toLowerCase());
+    const userIdx = memUsers.findIndex((u) => u.id === req.params.id && u.role === 'patient');
     if (userIdx !== -1) {
       if (safeUpdates.fullName) memUsers[userIdx].name = safeUpdates.fullName;
-      if (safeUpdates.email) memUsers[userIdx].email = safeUpdates.email;
       if (safeUpdates.avatar) memUsers[userIdx].avatar = safeUpdates.avatar;
     }
   } else {
-    memPatients[patientIdx] = { ...memPatients[patientIdx], ...updates };
+    memPatients[patientIdx] = { ...memPatients[patientIdx], ...sanitizeStaffPatientUpdates(updates) };
   }
 
   flushClinicStateToDisk();
 
-  if (isPatient) {
-    const allowed = ['fullName', 'email', 'phone', 'address', 'emergencyContact', 'bloodType', 'allergies', 'chronicConditions', 'avatar', 'dob', 'gender'];
-    const safeUpdates: any = {};
-    for (const key of allowed) {
-      if (updates[key] !== undefined) {
-        safeUpdates[key] = updates[key];
-      }
-    }
-    memPatients[patientIdx] = { ...memPatients[patientIdx], ...safeUpdates };
-
-    const userIdx = memUsers.findIndex((u) => u.id === req.params.id || u.email.toLowerCase() === memPatients[patientIdx].email.toLowerCase());
-    if (userIdx !== -1) {
-      if (safeUpdates.fullName) memUsers[userIdx].name = safeUpdates.fullName;
-      if (safeUpdates.email) memUsers[userIdx].email = safeUpdates.email;
-      if (safeUpdates.avatar) memUsers[userIdx].avatar = safeUpdates.avatar;
-    }
-  } else {
-    memPatients[patientIdx] = { ...memPatients[patientIdx], ...updates };
-  }
-
   if (supabaseServer) {
     (async () => {
       try {
-        await supabaseServer.from('patients').upsert(memPatients[patientIdx]);
+        await supabaseServer.from('patients').upsert(formatPatientForSupabase(memPatients[patientIdx]), { onConflict: 'id' });
       } catch (err) {
         console.error('Supabase patient upsert error:', err);
       }
@@ -2692,38 +2957,419 @@ app.put('/api/patients/:id', enforcePatientIsolation, (req: AuthenticatedRequest
 });
 
 /* ==========================================================================
-   APPOINTMENTS & SCHEDULING
+   PRE-CONSULTATION NURSING & CLINICAL VITALS INTAKE
    ========================================================================== */
-app.get('/api/appointments', (req: AuthenticatedRequest, res: Response) => {
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+app.post(
+  '/api/patients/:id/vitals',
+  requireVerifiedRoles('admin', 'doctor', 'nurse'),
+  (req: AuthenticatedRequest, res: Response) => {
+    const patientIdx = memPatients.findIndex((p) => p.id === req.params.id);
+    if (patientIdx === -1) {
+      return res.status(404).json({ error: 'Patient not found.' });
+    }
 
-  if (isPatient && linkedId) {
-    const patient = memPatients.find((p) => p.id === linkedId);
-    return res.json(
-      memAppointments.filter(
-        (a) => a.patientId === linkedId || (patient && a.patientName === patient.fullName)
-      )
-    );
+    const body = req.body || {};
+    const sys = Number(body.bloodPressureSystolic);
+    const dia = Number(body.bloodPressureDiastolic);
+    const hr = Number(body.heartRate);
+    const rr = Number(body.respiratoryRate || 16);
+    const temp = Number(body.temperature);
+    const spo2 = Number(body.oxygenSaturation || 98);
+    const heightCm = Number(body.height || 165);
+    const weightKg = Number(body.weight || 65);
+
+    if (
+      !Number.isFinite(sys) || sys < 50 || sys > 280 ||
+      !Number.isFinite(dia) || dia < 30 || dia > 180 ||
+      !Number.isFinite(hr) || hr < 25 || hr > 240 ||
+      !Number.isFinite(temp) || temp < 32 || temp > 43 ||
+      !Number.isFinite(spo2) || spo2 < 50 || spo2 > 100
+    ) {
+      return res.status(400).json({
+        error: 'Invalid vital signs values. Check Blood Pressure (50-280 / 30-180 mmHg), Heart Rate (25-240 bpm), Temperature (32-43 °C), and SpO₂ (50-100%).',
+      });
+    }
+
+    const heightM = heightCm > 0 ? heightCm / 100 : 1.65;
+    const computedBmi = Number((weightKg / (heightM * heightM)).toFixed(1));
+    const nowIso = new Date().toISOString();
+    const actorRole = req.user!.role;
+    const isPatientReported = Boolean(body.isPatientReported || body.source === 'patient-reported');
+    const resolvedSource: VitalsSource = isPatientReported
+      ? 'patient-reported'
+      : actorRole === 'nurse'
+      ? 'nurse-intake'
+      : (body.source as VitalsSource) || 'doctor-consultation';
+
+    const newVitals: Vitals = {
+      id: `vit-${Date.now()}`,
+      recordedAt: nowIso,
+      recordedBy: req.user?.name || (actorRole === 'nurse' ? 'Clinic Nurse' : 'Attending Physician'),
+      recordedById: req.user?.userId,
+      recordedByRole: actorRole,
+      appointmentId: body.appointmentId || undefined,
+      source: resolvedSource,
+      isPatientReported,
+      bloodPressureSystolic: sys,
+      bloodPressureDiastolic: dia,
+      heartRate: hr,
+      respiratoryRate: rr,
+      temperature: temp,
+      oxygenSaturation: spo2,
+      height: heightCm,
+      weight: weightKg,
+      bmi: Number.isFinite(computedBmi) ? computedBmi : 22.0,
+      notes: body.notes ? String(body.notes).trim() : undefined,
+    };
+
+    const existingHistory = Array.isArray(memPatients[patientIdx].vitalsHistory)
+      ? memPatients[patientIdx].vitalsHistory
+      : [];
+    // Prepend without silently overwriting historical measurements
+    memPatients[patientIdx] = {
+      ...memPatients[patientIdx],
+      vitalsHistory: [newVitals, ...existingHistory],
+    };
+
+    let updatedAppointment: Appointment | undefined;
+    if (body.appointmentId) {
+      const apt = memAppointments.find((a) => a.id === body.appointmentId);
+      if (apt) {
+        if (resolvedSource === 'nurse-intake') {
+          apt.nurseVitalsRecorded = true;
+          apt.nurseVitalsRecordedAt = nowIso;
+          apt.nurseVitalsRecordedBy = newVitals.recordedBy;
+        }
+        updatedAppointment = apt;
+      }
+    }
+
+    memAuditLogs.unshift({
+      id: `aud-${Date.now()}`,
+      timestamp: nowIso,
+      userId: req.user!.userId,
+      userName: newVitals.recordedBy,
+      userRole: actorRole,
+      action: resolvedSource === 'nurse-intake' ? 'NURSING_VITALS_RECORDED' : 'CLINICAL_VITALS_RECORDED',
+      resourceType: 'Patient',
+      resourceId: memPatients[patientIdx].id,
+      description: `Recorded ${isPatientReported ? 'patient-reported ' : ''}vital signs for ${memPatients[patientIdx].fullName} (BP ${sys}/${dia} mmHg, HR ${hr} bpm, Temp ${temp}°C, SpO₂ ${spo2}%).`,
+      ipAddress: String(req.ip || '127.0.0.1'),
+    });
+
+    flushClinicStateToDisk();
+
+    if (supabaseServer) {
+      supabaseServer
+        .from('patients')
+        .upsert(formatPatientForSupabase(memPatients[patientIdx]), { onConflict: 'id' })
+        .catch(() => {});
+    }
+
+    emitToStaffAndAdmin('vitals:recorded', {
+      patientId: memPatients[patientIdx].id,
+      vitals: newVitals,
+      appointment: updatedAppointment,
+    });
+
+    return res.status(201).json({
+      success: true,
+      vitals: newVitals,
+      patient: memPatients[patientIdx],
+      appointment: updatedAppointment,
+    });
+  }
+);
+
+/* ==========================================================================
+   APPOINTMENTS, SPECIALTY MATCHING & NON-PHI QR CHECK-IN
+   ========================================================================== */
+app.post('/api/appointments/match-specialty', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const reason = String(req.body?.reason || '').trim();
+  const rawBranch = String(req.body?.branch || 'Main Outpatient Clinic');
+  const branch: ClinicBranch =
+    rawBranch === 'Annex Satellite Clinic' ? 'Annex Satellite Clinic' : 'Main Outpatient Clinic';
+  const result = matchSpecialtiesForReason({
+    reason,
+    branch,
+    users: memUsers,
+  });
+  return res.json({ success: true, ...result });
+});
+
+app.get('/api/appointments', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  const isPatient = actorRole === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
+
+  if (isPatient) {
+    if (!linkedId) return res.json([]);
+    return res.json(memAppointments.filter((a) => a.patientId === linkedId));
+  }
+  if (!['admin', 'doctor', 'nurse', 'receptionist'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' is not authorized to read clinic appointments.` });
   }
   return res.json(memAppointments);
 });
 
-app.post('/api/appointments', async (req: AuthenticatedRequest, res: Response) => {
-  const newApt = req.body || {};
-  const actorRole = req.userRole || req.user?.role || 'patient';
-  const isPatient = actorRole === 'patient';
-  const isAuthorizedStaff = !isPatient;
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+app.post(
+  '/api/appointments/verify-qr',
+  requireVerifiedRoles('admin', 'doctor', 'nurse', 'receptionist'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const rawQr = String(req.body?.qrPayload || req.body?.bookingReference || req.body?.code || '').trim();
+    const confirmCheckIn = req.body?.confirmCheckIn !== false;
 
-  if (isPatient && linkedId) {
+    const parsed = parseScannedQrInput(rawQr);
+    if (parsed.mode === 'invalid') {
+      return res.status(400).json({ success: false, error: parsed.error || 'Invalid QR code or booking reference.' });
+    }
+
+    const refUpper = (parsed.bookingReference || '').toUpperCase();
+    const apt = memAppointments.find(
+      (a) =>
+        !a.isSynthetic &&
+        ((a.bookingReference && a.bookingReference.toUpperCase() === refUpper) || a.id.toUpperCase() === refUpper)
+    );
+
+    if (!apt) {
+      return res.status(404).json({
+        success: false,
+        error: `No confirmed appointment found for reference ${refUpper}.`,
+      });
+    }
+
+    if (parsed.mode === 'qr_token') {
+      const validSig = verifyQrTokenBinding(
+        apt.id,
+        apt.bookingReference || refUpper,
+        parsed.token || '',
+        apt.qrToken
+      );
+      if (!validSig) {
+        return res.status(403).json({
+          success: false,
+          error: 'QR token verification failed. Token signature is invalid or does not match this booking.',
+        });
+      }
+    }
+
+    if (apt.status === 'Cancelled' || apt.status === 'No Show') {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot check in appointment ${apt.bookingReference || apt.id} because its current status is '${apt.status}'.`,
+        appointment: apt,
+      });
+    }
+
+    if (apt.status === 'Completed') {
+      return res.status(400).json({
+        success: false,
+        error: `Appointment ${apt.bookingReference || apt.id} has already been completed.`,
+        appointment: apt,
+      });
+    }
+
+    const patient = memPatients.find((p) => p.id === apt.patientId) || null;
+
+    if (!confirmCheckIn) {
+      return res.json({
+        success: true,
+        verified: true,
+        alreadyCheckedIn: apt.status === 'Checked In' || apt.status === 'In Consultation',
+        appointment: apt,
+        patientSummary: patient
+          ? {
+              id: patient.id,
+              fullName: patient.fullName,
+              mrn: patient.mrn,
+              dob: patient.dob,
+              gender: patient.gender,
+              phone: patient.phone,
+            }
+          : null,
+      });
+    }
+
+    // Prevent duplicate QR check-ins
+    if (apt.status === 'Checked In' || apt.status === 'In Consultation') {
+      return res.status(409).json({
+        success: false,
+        alreadyCheckedIn: true,
+        error: `Duplicate check-in prevented: ${apt.patientName} (${apt.bookingReference || apt.id}) is already ${apt.status}.`,
+        appointment: apt,
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+    apt.status = 'Checked In';
+    apt.checkInAt = nowIso;
+    apt.checkedInBy = req.user?.name || req.user?.userId || 'Clinic Staff';
+    // Confirmed booked patients proceed by reserved appointment time — NEVER assign a walk-in queue number
+    if (!apt.isWalkIn && apt.type !== 'Walk-In') {
+      apt.queueNumber = undefined;
+    }
+
+    memAuditLogs.unshift({
+      id: `aud-${Date.now()}`,
+      timestamp: nowIso,
+      userId: req.user!.userId,
+      userName: apt.checkedInBy,
+      userRole: req.user!.role,
+      action: 'QR_APPOINTMENT_CHECKIN',
+      resourceType: 'Appointment',
+      resourceId: apt.id,
+      description: `Verified ${parsed.mode === 'qr_token' ? 'QR pass' : 'booking reference'} (${apt.bookingReference || apt.id}) and checked in ${apt.patientName} for ${apt.doctorName}.`,
+      ipAddress: String(req.ip || '127.0.0.1'),
+    });
+
+    createAndPersistNotification({
+      recipientId: apt.patientId,
+      patientId: apt.patientId,
+      recipientRole: 'patient',
+      targetRole: 'patient',
+      title: 'Checked In for Scheduled Appointment',
+      message: `Booking ${apt.bookingReference || apt.id} verified. Please proceed to ${apt.room || 'the consultation waiting area'} for your ${apt.time} schedule with ${apt.doctorName}.`,
+      category: 'appointment',
+      priority: 'normal',
+      relatedResourceId: apt.id,
+      relatedResourceType: 'appointment',
+    }).catch(() => {});
+
+    if (apt.doctorId) {
+      createAndPersistNotification({
+        recipientId: apt.doctorId,
+        doctorId: apt.doctorId,
+        recipientRole: 'doctor',
+        targetRole: 'provider',
+        title: 'Scheduled Patient Checked In',
+        message: `${apt.patientName} (${apt.bookingReference || apt.patientMrn}) has arrived and checked in for their ${apt.time} appointment.`,
+        category: 'appointment',
+        priority: 'normal',
+        relatedResourceId: apt.id,
+        relatedResourceType: 'appointment',
+      }).catch(() => {});
+    }
+
+    flushClinicStateToDisk();
+    emitToStaffAndAdmin('queue:updated', { appointment: apt, action: 'qr_checked_in', status: 'Checked In' });
+    emitToPatient(apt.patientId, 'appointment:updated', { appointment: apt });
+
+    if (supabaseServer) {
+      supabaseServer
+        .from('appointments')
+        .update({ status: 'Checked In', check_in_at: nowIso })
+        .eq('id', apt.id)
+        .catch(() => {});
+    }
+
+    return res.json({
+      success: true,
+      verified: true,
+      checkedIn: true,
+      appointment: apt,
+      patientSummary: patient
+        ? {
+            id: patient.id,
+            fullName: patient.fullName,
+            mrn: patient.mrn,
+            dob: patient.dob,
+            gender: patient.gender,
+            phone: patient.phone,
+          }
+        : null,
+    });
+  }
+);
+
+app.post('/api/appointments', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const newApt = { ...(req.body || {}) };
+  const actorRole = req.user!.role;
+  const isPatient = actorRole === 'patient';
+  const isAuthorizedStaff = ['admin', 'doctor', 'nurse', 'receptionist'].includes(actorRole);
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
+
+  if (!isPatient && !isAuthorizedStaff) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' cannot book clinic appointments.` });
+  }
+
+  const isWalkIn = Boolean(newApt.isWalkIn || newApt.type === 'Walk-In');
+  const branch: ClinicBranch =
+    newApt.branch === 'Annex Satellite Clinic' ? 'Annex Satellite Clinic' : 'Main Outpatient Clinic';
+  newApt.branch = branch;
+
+  if (isPatient) {
+    if (!linkedId) {
+      return res.status(403).json({ error: 'Forbidden: Patient account is not linked to a clinical profile.' });
+    }
     if (newApt.patientId && newApt.patientId !== linkedId) {
       return res.status(403).json({ error: 'Forbidden: Cannot book appointments for other patients.' });
     }
+    if (isWalkIn) {
+      return res.status(403).json({ error: 'Only authorized clinic staff can register walk-in visits.' });
+    }
     newApt.patientId = linkedId;
+    const patRecord = memPatients.find((p) => p.id === linkedId);
+    if (patRecord) {
+      newApt.patientName = patRecord.fullName;
+      newApt.patientMrn = patRecord.mrn;
+    }
+    delete newApt.staffOverrideReason;
+    delete newApt.staffOverrideBy;
   }
 
-  // 1. Check Same-Day No-Show Rebooking Restriction (Part 9)
+  // Enforce non-empty consultation reason
+  const cleanReason = String(newApt.reason || '').trim();
+  if (!cleanReason) {
+    return res.status(400).json({ error: 'Please provide a reason for consultation before booking.' });
+  }
+  newApt.reason = cleanReason;
+
+  // Verify doctor exists and supports selected branch / consultation mode
+  const matchedDoctor = memUsers.find((u) => u.id === newApt.doctorId && u.role === 'doctor');
+  if (!isWalkIn) {
+    if (!matchedDoctor || matchedDoctor.status === 'Inactive' || matchedDoctor.status === 'On Leave') {
+      return res.status(400).json({ error: 'Selected doctor does not exist or is currently unavailable.' });
+    }
+    if (!isDoctorOfferedAtBranch(matchedDoctor, branch)) {
+      return res.status(400).json({
+        error: `${matchedDoctor.name} does not hold clinic hours at ${branch}. Please select an available doctor at this branch.`,
+      });
+    }
+    newApt.doctorName = matchedDoctor.name;
+    newApt.department = newApt.department || matchedDoctor.department || matchedDoctor.specialty || 'General Medicine';
+    newApt.specialty = newApt.specialty || matchedDoctor.specialty || newApt.department;
+
+    // Enforce Phase 3.6: No same-day or past-date online booking in Asia/Manila (applies to In-Person AND Online Consultation)
+    const dateValidation = validatePatientBookingDateManila(String(newApt.date || ''));
+    if (!dateValidation.valid) {
+      return res.status(400).json({
+        error: dateValidation.error,
+        earliestBookableDate: dateValidation.earliestBookableDate,
+        todayManila: dateValidation.todayManila,
+      });
+    }
+
+    const requestedMode: ConsultationMode =
+      newApt.consultationMode === 'Online Consultation' || newApt.type === 'Online Consultation' || newApt.type === 'Telehealth'
+        ? 'Online Consultation'
+        : 'In-Person';
+
+    if (
+      requestedMode === 'Online Consultation' &&
+      Array.isArray(matchedDoctor.consultationModes) &&
+      matchedDoctor.consultationModes.length > 0 &&
+      !matchedDoctor.consultationModes.includes('Online Consultation')
+    ) {
+      return res.status(400).json({
+        error: `${matchedDoctor.name} currently supports In-Person consultations only.`,
+      });
+    }
+
+    newApt.consultationMode = requestedMode;
+    newApt.type = requestedMode === 'Online Consultation' ? 'Online Consultation' : 'In-Person';
+  }
+
+  // 1. Check Same-Day No-Show Rebooking Restriction
   const rebookCheck = canPatientRebookOnDate({
     patientId: newApt.patientId,
     targetDate: newApt.date,
@@ -2738,14 +3384,13 @@ app.post('/api/appointments', async (req: AuthenticatedRequest, res: Response) =
     });
   }
 
-  // 2. Check Walk-In Daily Capacity Without Displacing Confirmed Online Bookings (Part 9)
-  const isWalkIn = Boolean(newApt.isWalkIn || newApt.type === 'Walk-In');
+  // 2. Check Walk-In Daily Capacity Without Displacing Confirmed Online Bookings
   if (isWalkIn) {
     if (!isAuthorizedStaff) {
       return res.status(403).json({ error: 'Only authorized clinic staff can register walk-in visits.' });
     }
     const targetDocUser: User =
-      memUsers.find((u) => u.id === newApt.doctorId) || {
+      matchedDoctor || {
         id: newApt.doctorId || 'usr-1',
         name: newApt.doctorName || 'Dr. Maria Cristina Reyes, MD',
         email: 'doctor@smartclinic.ph',
@@ -2768,14 +3413,23 @@ app.post('/api/appointments', async (req: AuthenticatedRequest, res: Response) =
     }
     newApt.isWalkIn = true;
     newApt.type = 'Walk-In';
+    newApt.consultationMode = 'In-Person';
+    newApt.status = newApt.status || 'Checked In';
+    const todayWalkInCount =
+      memAppointments.filter(
+        (a) => (a.isWalkIn || a.type === 'Walk-In') && getManilaDateString(a.date) === getManilaDateString(newApt.date)
+      ).length + 1;
+    newApt.queueNumber = newApt.queueNumber || `W-${String(todayWalkInCount).padStart(3, '0')}`;
+    newApt.nurseVitalsRecorded = Boolean(newApt.nurseVitalsRecorded);
   }
 
-  // 3. Prevent Double-Booking & Duplicate Active Queue Entries (Part 9)
+  // 3. Prevent Double-Booking Across Both In-Person and Online Consultation Schedules
   const slotValidation = validateAppointmentSlotBooking({
     patientId: newApt.patientId,
     doctorId: newApt.doctorId,
     date: newApt.date,
     time: newApt.time,
+    durationMinutes: Number(newApt.durationMinutes) || 30,
     appointments: memAppointments,
     checkDuplicateQueue: isWalkIn,
   });
@@ -2785,19 +3439,36 @@ app.post('/api/appointments', async (req: AuthenticatedRequest, res: Response) =
     });
   }
 
-  if (!newApt.id) newApt.id = `apt-${Date.now()}`;
-  newApt.createdAt = newApt.createdAt || new Date().toISOString();
-  newApt.branch = newApt.branch || 'Main Outpatient Clinic';
-  if (newApt.status === 'Checked In' && !newApt.checkInAt) {
-    newApt.checkInAt = new Date().toISOString();
+  const nowIso = new Date().toISOString();
+  if (!newApt.id) newApt.id = `apt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  newApt.createdAt = newApt.createdAt || nowIso;
+  newApt.durationMinutes = Number(newApt.durationMinutes) || 30;
+
+  // Phase 3.4 & Phase 4: Automatic confirmation, Booking Reference, non-PHI QR token, and NO walk-in queue number
+  if (!isWalkIn) {
+    newApt.status = 'Confirmed';
+    newApt.confirmedAt = nowIso;
+    newApt.bookingReference = newApt.bookingReference || generateBookingReference(newApt.date);
+    newApt.qrToken = generateAppointmentQrToken(newApt.id, newApt.bookingReference);
+    newApt.queueNumber = undefined;
+    if (newApt.consultationMode === 'Online Consultation') {
+      newApt.teleconsultRoomId = `tc-${newApt.id}`;
+      newApt.teleconsultStatus = 'Scheduled';
+      newApt.room = 'Private Online Consultation Room';
+    } else {
+      newApt.room = newApt.room || (branch === 'Annex Satellite Clinic' ? 'Annex Room 101' : 'Consultation Room 1');
+    }
+  } else if (newApt.status === 'Checked In' && !newApt.checkInAt) {
+    newApt.checkInAt = nowIso;
+    newApt.checkedInBy = req.user?.name || req.userId || 'Clinic Staff';
   }
 
   // Audit Log if Staff Overrode a Same-Day No-Show Rebooking
   if (isAuthorizedStaff && newApt.staffOverrideReason) {
     newApt.staffOverrideBy = req.user?.name || req.userId || 'Authorized Clinic Staff';
-    const overrideLog: AuditLog = {
+    memAuditLogs.unshift({
       id: `aud-${Date.now()}`,
-      timestamp: new Date().toISOString(),
+      timestamp: nowIso,
       userId: req.userId || 'usr-staff',
       userName: newApt.staffOverrideBy,
       userRole: (actorRole as UserRole) || 'receptionist',
@@ -2806,14 +3477,13 @@ app.post('/api/appointments', async (req: AuthenticatedRequest, res: Response) =
       resourceId: newApt.id,
       description: `Staff overrode same-day No-Show lock on ${newApt.date} for ${newApt.patientName}. Reason: ${newApt.staffOverrideReason}`,
       ipAddress: String(req.ip || '127.0.0.1'),
-    };
-    memAuditLogs.unshift(overrideLog);
+    });
   }
 
   memAppointments.unshift(newApt);
   flushClinicStateToDisk();
 
-  emitToStaffAndAdmin('queue:updated', { appointment: newApt, action: isWalkIn ? 'walk_in_registered' : 'created' });
+  emitToStaffAndAdmin('queue:updated', { appointment: newApt, action: isWalkIn ? 'walk_in_registered' : 'booking_confirmed' });
   if (newApt.patientId) {
     emitToPatient(newApt.patientId, 'appointment:updated', { appointment: newApt });
   }
@@ -2824,18 +3494,22 @@ app.post('/api/appointments', async (req: AuthenticatedRequest, res: Response) =
       await supabaseServer.from('appointments').upsert(
         {
           id: newApt.id,
+          booking_reference: newApt.bookingReference || null,
           patient_id: newApt.patientId || null,
           patient_name: newApt.patientName,
           patient_mrn: newApt.patientMrn,
           doctor_id: newApt.doctorId || null,
           doctor_name: newApt.doctorName,
           department: newApt.department,
+          branch: newApt.branch,
           appointment_date: newApt.date,
           appointment_time: newApt.time,
           duration_minutes: newApt.durationMinutes || 30,
           reason: newApt.reason,
-          status: newApt.status || 'Scheduled',
+          status: newApt.status,
           type: newApt.type || 'In-Person',
+          consultation_mode: newApt.consultationMode || 'In-Person',
+          is_walk_in: Boolean(newApt.isWalkIn),
           queue_number: newApt.queueNumber || null,
           room: newApt.room || null,
           notes: newApt.notes || null,
@@ -2847,33 +3521,26 @@ app.post('/api/appointments', async (req: AuthenticatedRequest, res: Response) =
     }
   }
 
-  // Create strictly scoped notification for the patient
-  createAndPersistNotification({
-    recipientId: newApt.patientId,
-    patientId: newApt.patientId,
-    recipientRole: 'patient',
-    targetRole: 'patient',
-    title: isWalkIn ? 'Walk-In Visit Registered' : 'Appointment Scheduled',
-    message: isWalkIn
-      ? `You are registered in the outpatient walk-in queue (${newApt.queueNumber || 'Walk-In'}) with ${newApt.doctorName}.`
-      : `Your appointment with ${newApt.doctorName} is scheduled for ${newApt.date} at ${newApt.time}.`,
-    content: `Your ${newApt.department || 'Consultation'} with ${newApt.doctorName} is recorded for ${newApt.date} at ${newApt.time}. Assigned Room: ${newApt.room || 'Outpatient Clinic'}.`,
-    category: 'appointment',
-    priority: 'normal',
-    relatedResourceId: newApt.id,
-    relatedResourceType: 'appointment',
-  }).catch(() => {});
-
-  // Create strictly scoped notification for the attending doctor
-  if (newApt.doctorId) {
+  const patObj = memPatients.find((p) => p.id === newApt.patientId) || null;
+  if (!isWalkIn) {
+    // Immediate Booking Confirmation across In-App + Consented Email/WebPush channels
+    dispatchAppointmentEventNotification({
+      appointment: newApt,
+      patient: patObj,
+      reminderType: 'BOOKING_CONFIRMATION',
+      preferences: memNotificationPreferences.get(newApt.patientId),
+      existingLogs: memReminderLogs,
+      createInAppNotification: createAndPersistNotification,
+    }).then(() => flushClinicStateToDisk()).catch(() => {});
+  } else {
     createAndPersistNotification({
-      recipientId: newApt.doctorId,
-      doctorId: newApt.doctorId,
-      recipientRole: 'doctor',
-      targetRole: 'provider',
-      title: isWalkIn ? 'Walk-In Patient Added to Queue' : 'New Consultation Booked',
-      message: `${newApt.patientName} (${newApt.patientMrn}) ${isWalkIn ? 'checked in as walk-in' : 'scheduled an appointment'} for ${newApt.date} at ${newApt.time}.`,
-      content: `Appointment recorded: ${newApt.patientName} (${newApt.patientMrn}) with ${newApt.doctorName} on ${newApt.date} at ${newApt.time}. Reason: ${newApt.reason}.`,
+      recipientId: newApt.patientId,
+      patientId: newApt.patientId,
+      recipientRole: 'patient',
+      targetRole: 'patient',
+      title: 'Walk-In Visit Registered',
+      message: `You are registered in the outpatient walk-in queue (${newApt.queueNumber}) with ${newApt.doctorName}.`,
+      content: `Walk-in queue number ${newApt.queueNumber} assigned for ${newApt.department || 'General Medicine'}. Please proceed to Pre-Consultation Nursing Vitals Intake.`,
       category: 'appointment',
       priority: 'normal',
       relatedResourceId: newApt.id,
@@ -2881,47 +3548,117 @@ app.post('/api/appointments', async (req: AuthenticatedRequest, res: Response) =
     }).catch(() => {});
   }
 
-  return res.status(201).json(newApt);
+  // Notify attending doctor
+  if (newApt.doctorId) {
+    createAndPersistNotification({
+      recipientId: newApt.doctorId,
+      doctorId: newApt.doctorId,
+      recipientRole: 'doctor',
+      targetRole: 'provider',
+      title: isWalkIn ? 'Walk-In Patient Added to Queue' : 'Confirmed Appointment Scheduled',
+      message: `${newApt.patientName} (${newApt.bookingReference || newApt.queueNumber || newApt.patientMrn}) ${isWalkIn ? 'registered as walk-in' : `confirmed for ${newApt.date} at ${newApt.time} (${newApt.consultationMode})`}.`,
+      content: `Patient: ${newApt.patientName} (${newApt.patientMrn}) • Mode: ${newApt.consultationMode || newApt.type} • Reason: ${newApt.reason}.`,
+      category: 'appointment',
+      priority: 'normal',
+      relatedResourceId: newApt.id,
+      relatedResourceType: 'appointment',
+    }).catch(() => {});
+  }
+
+  return res.status(201).json({
+    ...newApt,
+    qrPayload:
+      !isWalkIn && newApt.bookingReference && newApt.qrToken
+        ? buildNonPhiQrPayloadString(newApt.bookingReference, newApt.qrToken)
+        : undefined,
+  });
 });
 
-app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res: Response) => {
+app.patch('/api/appointments/:id/status', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
-  const { status, room, queueNumber, notes } = req.body || {};
+  let { status, room, queueNumber, notes, staffOverrideReason } = req.body || {};
   const apt = memAppointments.find((a) => a.id === id);
   if (!apt) return res.status(404).json({ error: 'Appointment not found' });
+
+  const actorRole = req.user!.role;
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
+  if (actorRole === 'patient') {
+    if (!linkedId || apt.patientId !== linkedId) {
+      return res.status(403).json({ error: 'Forbidden: You can only cancel your own appointments.' });
+    }
+    if (status !== 'Cancelled') {
+      return res.status(403).json({ error: 'Forbidden: Patients can only cancel appointments; status transitions require clinic staff.' });
+    }
+    room = undefined;
+    queueNumber = undefined;
+  } else if (!['admin', 'doctor', 'nurse', 'receptionist'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' is not authorized to change appointment status.` });
+  }
+
+  const isWalkIn = Boolean(apt.isWalkIn || apt.type === 'Walk-In');
+
+  // Phase 4.3 & 5.1: Confirmed booked appointments do not use walk-in Call Patient queuing
+  if (status === 'Called' && !isWalkIn) {
+    return res.status(400).json({
+      error: 'Scheduled appointments already have reserved consultation times and do not use walk-in Call Patient queuing. Verify check-in via QR or Booking Reference instead.',
+    });
+  }
+
+  // Phase 4.4: Enforce configurable 30-minute No-Show grace period unless staff documents override reason
+  if (status === 'No Show') {
+    const eligibility = isAppointmentEligibleForNoShow(apt, memClinicSettings.noShowGraceMinutes);
+    const hasOverride = typeof staffOverrideReason === 'string' && staffOverrideReason.trim().length >= 5;
+    if (!eligibility.eligible && !hasOverride) {
+      return res.status(409).json({
+        error: `Cannot mark No Show yet: ${memClinicSettings.noShowGraceMinutes}-minute arrival grace period has not elapsed (${Math.max(0, eligibility.minutesLate)} min elapsed). Provide a documented override reason if patient confirmed non-arrival.`,
+        graceMinutes: memClinicSettings.noShowGraceMinutes,
+        minutesLate: eligibility.minutesLate,
+      });
+    }
+  }
 
   const nowIso = new Date().toISOString();
   apt.status = status;
   if (room) apt.room = room;
-  if (queueNumber) apt.queueNumber = queueNumber;
+  if (queueNumber && isWalkIn) apt.queueNumber = queueNumber;
+  if (!isWalkIn) apt.queueNumber = undefined;
   if (notes !== undefined) apt.notes = notes;
 
   if (status === 'Checked In') {
     apt.checkInAt = apt.checkInAt || nowIso;
+    apt.checkedInBy = apt.checkedInBy || req.user?.name || req.userId || 'Clinic Staff';
   } else if (status === 'Called') {
     apt.calledAt = nowIso;
+    apt.calledBy = req.user?.name || req.userId || 'Clinic Staff';
     apt.calledAcknowledgedAt = undefined;
+  } else if (status === 'In Consultation') {
+    apt.consultationStartedAt = apt.consultationStartedAt || nowIso;
   } else if (status === 'Completed') {
     apt.completedAt = nowIso;
   } else if (status === 'No Show') {
     apt.noShowMarkedAt = nowIso;
+    apt.noShowMarkedBy = req.user?.name || req.userId || 'Clinic Staff';
+    if (staffOverrideReason) {
+      apt.staffOverrideReason = String(staffOverrideReason).trim();
+      apt.staffOverrideBy = apt.noShowMarkedBy;
+    }
+    memAuditLogs.unshift({
+      id: `aud-${Date.now()}`,
+      timestamp: nowIso,
+      userId: req.user!.userId,
+      userName: apt.noShowMarkedBy,
+      userRole: actorRole,
+      action: 'APPOINTMENT_MARKED_NOSHOW',
+      resourceType: 'Appointment',
+      resourceId: apt.id,
+      description: `Marked ${apt.patientName} (${apt.bookingReference || apt.queueNumber || apt.id}) as No Show.${staffOverrideReason ? ` Override: ${staffOverrideReason}` : ''}`,
+      ipAddress: String(req.ip || '127.0.0.1'),
+    });
   }
 
-  if (status === 'Confirmed') {
-    createAndPersistNotification({
-      recipientId: apt.patientId,
-      patientId: apt.patientId,
-      recipientRole: 'patient',
-      targetRole: 'patient',
-      title: 'Appointment Approved',
-      message: `Your appointment with ${apt.doctorName} has been approved.`,
-      content: `Your appointment with ${apt.doctorName} on ${apt.date} at ${apt.time} (${apt.type}) has been approved. Location: ${apt.room || 'Outpatient Clinic'}. Queue Number: ${apt.queueNumber || 'Standard Queue'}.`,
-      category: 'appointment',
-      priority: 'normal',
-      relatedResourceId: apt.id,
-      relatedResourceType: 'appointment',
-    }).catch(() => {});
-  } else if (status === 'Called') {
+  const patObj = memPatients.find((p) => p.id === apt.patientId) || null;
+
+  if (status === 'Called' && isWalkIn) {
     const designatedRoom = apt.room || 'Consultation Room 1';
     const manilaTimeLabel = formatManilaDateTime(nowIso);
     const callNotification = await createAndPersistNotification({
@@ -2931,7 +3668,7 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
       targetRole: 'patient',
       title: "It's Your Turn!",
       message: 'Clinic staff is ready for you. Please proceed to the designated clinic room.',
-      content: `Queue Ticket: ${apt.queueNumber || 'Assigned'} • Status: Called • Designated Room: ${designatedRoom} • Time: ${manilaTimeLabel}`,
+      content: `Walk-In Queue: ${apt.queueNumber || 'Assigned'} • Status: Called • Room: ${designatedRoom} • Time: ${manilaTimeLabel}`,
       category: 'queue_call',
       priority: 'urgent',
       relatedResourceId: apt.id,
@@ -2941,20 +3678,18 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
       appointmentId: apt.id,
     });
 
-    // Immediate Real-Time Delivery over WebSocket strictly to the called patient
     emitToPatient(apt.patientId, 'patient:called', {
       appointment: apt,
       notification: callNotification,
       title: "It's Your Turn!",
       message: 'Clinic staff is ready for you. Please proceed to the designated clinic room.',
-      queueNumber: apt.queueNumber || 'Queue',
+      queueNumber: apt.queueNumber || 'Walk-In',
       status: 'Called',
       room: designatedRoom,
       calledAt: nowIso,
       manilaTimeLabel,
     });
 
-    // Privacy-Safe Mobile/Browser Web Push Notification (No confidential medical details on lock screen)
     sendPrivacySafeQueuePush(apt.patientId, {
       appointmentId: apt.id,
       queueNumber: apt.queueNumber,
@@ -2968,19 +3703,14 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
       }
     });
 
-    createAndPersistNotification({
-      recipientId: apt.patientId,
-      patientId: apt.patientId,
-      recipientRole: 'patient',
-      targetRole: 'patient',
-      title: 'Appointment Cancelled',
-      message: `Your appointment with ${apt.doctorName} on ${apt.date} at ${apt.time} has been cancelled.`,
-      content: `Your appointment reservation with ${apt.doctorName} on ${apt.date} has been cancelled and removed from the active queue. You may reschedule whenever convenient.`,
-      category: 'appointment',
-      priority: 'normal',
-      relatedResourceId: apt.id,
-      relatedResourceType: 'appointment',
-    }).catch(() => {});
+    dispatchAppointmentEventNotification({
+      appointment: apt,
+      patient: patObj,
+      reminderType: 'CANCELLATION_NOTICE',
+      preferences: memNotificationPreferences.get(apt.patientId),
+      existingLogs: memReminderLogs,
+      createInAppNotification: createAndPersistNotification,
+    }).then(() => flushClinicStateToDisk()).catch(() => {});
 
     if (apt.doctorId) {
       createAndPersistNotification({
@@ -2989,26 +3719,14 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
         recipientRole: 'doctor',
         targetRole: 'provider',
         title: 'Consultation Cancelled',
-        message: `${apt.patientName} (${apt.patientMrn}) appointment on ${apt.date} at ${apt.time} was cancelled.`,
-        content: `Patient ${apt.patientName} was cancelled and cleared from your schedule and live waiting queue.`,
+        message: `${apt.patientName} (${apt.bookingReference || apt.patientMrn}) appointment on ${apt.date} at ${apt.time} was cancelled.`,
+        content: `Appointment slot on ${apt.date} at ${apt.time} has been released.`,
         category: 'appointment',
         priority: 'normal',
         relatedResourceId: apt.id,
         relatedResourceType: 'appointment',
       }).catch(() => {});
     }
-
-    createAndPersistNotification({
-      targetRole: 'provider',
-      recipientRole: 'receptionist',
-      title: 'Queue Updated — Appointment Cancelled',
-      message: `Patient ${apt.patientName} (${apt.queueNumber || 'Queue'}) cancelled and removed from waiting room.`,
-      content: `Reception desk: ${apt.patientName} (${apt.patientMrn}) cancelled consultation with ${apt.doctorName}. Live queue updated.`,
-      category: 'appointment',
-      priority: 'normal',
-      relatedResourceId: apt.id,
-      relatedResourceType: 'appointment',
-    }).catch(() => {});
   } else if (status === 'Completed') {
     memNotifications.forEach((n) => {
       if (n.relatedResourceId === apt.id || n.appointmentId === apt.id) n.read = true;
@@ -3021,20 +3739,21 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
       targetRole: 'patient',
       title: 'Consultation Completed',
       message: `Your consultation with ${apt.doctorName} is complete.`,
-      content: `Clinical notes and any issued prescriptions or diagnostic orders are now accessible in your patient portal.`,
+      content: `Clinical notes and any issued prescriptions or released diagnostic results are accessible in your patient portal.`,
       category: 'appointment',
       priority: 'normal',
       relatedResourceId: apt.id,
       relatedResourceType: 'appointment',
     }).catch(() => {});
   } else if (status === 'Checked In') {
+    const refText = isWalkIn ? `walk-in queue #${apt.queueNumber || 'W-001'}` : `booking ${apt.bookingReference || apt.id}`;
     createAndPersistNotification({
       recipientId: apt.patientId,
       patientId: apt.patientId,
       recipientRole: 'patient',
       targetRole: 'patient',
-      title: 'Checked In to Outpatient Clinic',
-      message: `You are checked in with ticket #${apt.queueNumber || 'Q-10'}. Please wait in ${apt.room || 'Waiting Area'} until clinic staff calls you.`,
+      title: 'Checked In at Outpatient Clinic',
+      message: `You are checked in (${refText}). Please proceed to ${apt.room || 'the consultation area'}.`,
       category: 'appointment',
       priority: 'normal',
       relatedResourceId: apt.id,
@@ -3047,8 +3766,8 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
         doctorId: apt.doctorId,
         recipientRole: 'doctor',
         targetRole: 'provider',
-        title: 'Patient Checked In: Waiting in Lobby',
-        message: `${apt.patientName} (${apt.patientMrn}) checked in with ticket #${apt.queueNumber || 'Q-10'}. Waiting in ${apt.room || 'Waiting Area'}.`,
+        title: 'Patient Checked In',
+        message: `${apt.patientName} (${refText}) checked in for consultation.`,
         category: 'appointment',
         priority: 'normal',
         relatedResourceId: apt.id,
@@ -3068,7 +3787,7 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
       recipientRole: 'patient',
       targetRole: 'patient',
       title: 'Consultation In Progress',
-      message: `Ticket #${apt.queueNumber || 'Q-10'} is now in consultation in ${apt.room || 'Room 302'} with ${apt.doctorName}.`,
+      message: `Your consultation with ${apt.doctorName} is now in progress (${apt.room || 'Consultation Room'}).`,
       category: 'appointment',
       priority: 'high',
       relatedResourceId: apt.id,
@@ -3086,7 +3805,7 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
       targetRole: 'patient',
       title: 'Appointment Marked as No-Show',
       message: `You missed your scheduled consultation on ${apt.date} at ${apt.time}.`,
-      content: `Our outpatient records show you missed your scheduled slot on ${apt.date} with ${apt.doctorName}. Same-day online self-rebooking is disabled; please book for a future date or contact clinic reception for assistance.`,
+      content: `Our outpatient records show you missed your scheduled slot on ${apt.date} with ${apt.doctorName}. Same-day online self-rebooking is disabled; please book for a future date starting tomorrow or contact clinic reception.`,
       category: 'appointment',
       priority: 'normal',
       relatedResourceId: apt.id,
@@ -3105,8 +3824,9 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
     try {
       const updateData: any = { status };
       if (room) updateData.room = room;
-      if (queueNumber) updateData.queue_number = queueNumber;
+      if (isWalkIn && queueNumber) updateData.queue_number = queueNumber;
       if (notes !== undefined) updateData.notes = notes;
+      if (apt.noShowMarkedAt) updateData.no_show_marked_at = apt.noShowMarkedAt;
       await supabaseServer.from('appointments').update(updateData).eq('id', id);
     } catch (err: any) {
       console.error('Failed to sync appointment status to Supabase:', err?.message);
@@ -3116,14 +3836,14 @@ app.patch('/api/appointments/:id/status', async (req: AuthenticatedRequest, res:
   return res.json({ success: true, appointment: apt });
 });
 
-app.post('/api/appointments/:id/acknowledge-call', (req: AuthenticatedRequest, res: Response) => {
+app.post('/api/appointments/:id/acknowledge-call', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const apt = memAppointments.find((a) => a.id === id);
   if (!apt) return res.status(404).json({ error: 'Appointment not found' });
 
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId || req.userId;
-  if (isPatient && linkedId && apt.patientId !== linkedId) {
+  const isPatient = req.user?.role === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId || req.user?.userId;
+  if (isPatient && (!linkedId || apt.patientId !== linkedId)) {
     return res.status(403).json({ error: 'Forbidden: You can only acknowledge your own clinic call notification.' });
   }
 
@@ -3137,23 +3857,71 @@ app.post('/api/appointments/:id/acknowledge-call', (req: AuthenticatedRequest, r
   });
 
   flushClinicStateToDisk();
+  if (supabaseServer) {
+    supabaseServer
+      .from('appointments')
+      .update({ called_acknowledged_at: ackIso })
+      .eq('id', apt.id)
+      .then(({ error }) => {
+        if (error) console.warn('Supabase acknowledge-call sync notice:', error.message);
+      });
+  }
   emitToStaffAndAdmin('queue:acknowledged', { appointmentId: apt.id, patientId: apt.patientId, acknowledgedAt: ackIso });
   emitToPatient(apt.patientId, 'appointment:updated', { appointment: apt });
 
   return res.json({ success: true, appointment: apt, acknowledgedAt: ackIso });
 });
 
-app.patch('/api/appointments/:id', async (req: AuthenticatedRequest, res: Response) => {
+app.patch('/api/appointments/:id', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const aptIdx = memAppointments.findIndex((a) => a.id === id);
   if (aptIdx === -1) return res.status(404).json({ error: 'Appointment not found' });
-  const updates = req.body || {};
+  const rawUpdates = req.body || {};
+  const actorRole = req.user!.role;
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
 
-  // Rule 1 & Rule 2: Date comparison and same-day reschedule check
+  let updates: Record<string, any> = {};
+  if (actorRole === 'patient') {
+    if (!linkedId || memAppointments[aptIdx].patientId !== linkedId) {
+      return res.status(403).json({ error: 'Forbidden: You may only modify your own appointments.' });
+    }
+    const allowedPatientFields = ['date', 'time', 'reason', 'notes', 'type', 'consultationMode', 'originalDate', 'requestedDate', 'wasSameDay'];
+    for (const k of allowedPatientFields) {
+      if (rawUpdates[k] !== undefined) updates[k] = rawUpdates[k];
+    }
+    if (rawUpdates.status === 'Cancelled') {
+      updates.status = 'Cancelled';
+    }
+  } else if (['admin', 'doctor', 'nurse', 'receptionist'].includes(actorRole)) {
+    updates = { ...rawUpdates };
+    delete updates.id;
+  } else {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' cannot modify appointments.` });
+  }
+
   if (updates.date) {
     const origDate = updates.originalDate || memAppointments[aptIdx].date;
     const ruleResult = applyReschedulingRule(updates.date, origDate);
     updates.date = ruleResult.finalDate;
+    if (actorRole === 'patient') {
+      const dateCheck = validatePatientBookingDateManila(updates.date);
+      if (!dateCheck.valid) {
+        return res.status(400).json({ error: dateCheck.error });
+      }
+    }
+    const targetTime = updates.time || memAppointments[aptIdx].time;
+    const slotCheck = validateAppointmentSlotBooking({
+      patientId: memAppointments[aptIdx].patientId,
+      doctorId: memAppointments[aptIdx].doctorId,
+      date: updates.date,
+      time: targetTime,
+      durationMinutes: memAppointments[aptIdx].durationMinutes || 30,
+      appointments: memAppointments,
+      excludeAppointmentId: id,
+    });
+    if (!slotCheck.valid) {
+      return res.status(409).json({ error: slotCheck.error });
+    }
   }
 
   memAppointments[aptIdx] = { ...memAppointments[aptIdx], ...updates };
@@ -3182,24 +3950,80 @@ app.patch('/api/appointments/:id', async (req: AuthenticatedRequest, res: Respon
   return res.json({ success: true, appointment: memAppointments[aptIdx] });
 });
 
-app.post('/api/appointments/:id/reschedule', async (req: AuthenticatedRequest, res: Response) => {
+app.post('/api/appointments/:id/reschedule', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const apt = memAppointments.find((a) => a.id === id);
   if (!apt) return res.status(404).json({ error: 'Appointment not found' });
 
+  const actorRole = req.user!.role;
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
+  if (actorRole === 'patient') {
+    if (!linkedId || apt.patientId !== linkedId) {
+      return res.status(403).json({ error: 'Forbidden: You may only reschedule your own appointments.' });
+    }
+  } else if (!['admin', 'doctor', 'nurse', 'receptionist'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' cannot reschedule appointments.` });
+  }
+
   const { requestedDate, newTime } = req.body || {};
   if (!requestedDate) return res.status(400).json({ error: 'requestedDate is required' });
 
-  // Apply Rule 1 & Rule 2:
-  // If requested_date == original_appointment_date:
-  //   final_date = original_appointment_date + 1 day
-  // Otherwise:
-  //   final_date = requested_date
   const ruleResult = applyReschedulingRule(requestedDate, apt.date);
-  apt.date = ruleResult.finalDate;
-  if (newTime) apt.time = newTime;
-  apt.status = 'Scheduled';
+  const candidateDate = ruleResult.finalDate;
+  const candidateTime = newTime || apt.time;
+
+  if (actorRole === 'patient') {
+    const manilaCheck = validatePatientBookingDateManila(candidateDate);
+    if (!manilaCheck.valid) {
+      return res.status(400).json({ error: manilaCheck.error });
+    }
+  }
+
+  const slotCheck = validateAppointmentSlotBooking({
+    patientId: apt.patientId,
+    doctorId: apt.doctorId,
+    date: candidateDate,
+    time: candidateTime,
+    durationMinutes: apt.durationMinutes || 30,
+    appointments: memAppointments,
+    excludeAppointmentId: apt.id,
+  });
+  if (!slotCheck.valid) {
+    return res.status(409).json({ error: slotCheck.error });
+  }
+
+  apt.date = candidateDate;
+  apt.time = candidateTime;
+  apt.status = apt.isWalkIn ? 'Scheduled' : 'Confirmed';
+  apt.reminder24hSentAt = undefined;
+  apt.reminder2hSentAt = undefined;
   flushClinicStateToDisk();
+
+  const patObj = memPatients.find((p) => p.id === apt.patientId) || null;
+  dispatchAppointmentEventNotification({
+    appointment: apt,
+    patient: patObj,
+    reminderType: 'RESCHEDULE_NOTICE',
+    preferences: memNotificationPreferences.get(apt.patientId),
+    existingLogs: memReminderLogs,
+    createInAppNotification: createAndPersistNotification,
+  }).then(() => flushClinicStateToDisk()).catch(() => {});
+
+  emitToStaffAndAdmin('queue:updated', { appointment: apt, action: 'rescheduled' });
+  emitToPatient(apt.patientId, 'appointment:updated', { appointment: apt });
+
+  if (supabaseServer) {
+    try {
+      const dbUpdate: Record<string, unknown> = {
+        appointment_date: apt.date,
+        appointment_time: apt.time,
+        status: apt.status,
+      };
+      await supabaseServer.from('appointments').update(dbUpdate).eq('id', apt.id);
+    } catch (err: any) {
+      console.warn('Supabase reschedule sync notice:', err?.message);
+    }
+  }
 
   return res.json({
     success: true,
@@ -3215,24 +4039,54 @@ app.post('/api/appointments/:id/reschedule', async (req: AuthenticatedRequest, r
 /* ==========================================================================
    CONSULTATIONS (SOAP, Diagnoses, Certs)
    ========================================================================== */
-app.get('/api/consultations', (req: AuthenticatedRequest, res: Response) => {
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+app.get('/api/consultations', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  const isPatient = actorRole === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
 
-  if (isPatient && linkedId) {
-    const patient = memPatients.find((p) => p.id === linkedId);
-    return res.json(
-      memConsultations.filter(
-        (c) => c.patientId === linkedId || (patient && c.patientName === patient.fullName)
-      )
-    );
+  if (isPatient) {
+    if (!linkedId) return res.json([]);
+    return res.json(memConsultations.filter((c) => c.patientId === linkedId));
+  }
+  if (!['admin', 'doctor', 'nurse'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' is not authorized to read clinical consultation SOAP notes.` });
   }
   return res.json(memConsultations);
 });
 
-app.post('/api/consultations', (req: Request, res: Response) => {
-  const newConsult = req.body;
+app.post('/api/consultations', requireVerifiedRoles('admin', 'doctor'), (req: AuthenticatedRequest, res: Response) => {
+  const newConsult = { ...(req.body || {}) };
   if (!newConsult.id) newConsult.id = `con-${Date.now()}`;
+  newConsult.doctorId = newConsult.doctorId || req.user!.userId;
+  newConsult.doctorName = newConsult.doctorName || req.user!.name;
+  newConsult.date = newConsult.date || new Date().toISOString();
+
+  // Persist consultation vitals to patient vitalsHistory if included without overwriting older entries
+  if (newConsult.vitals && newConsult.patientId) {
+    const patIdx = memPatients.findIndex((p) => p.id === newConsult.patientId);
+    if (patIdx !== -1 && Number(newConsult.vitals.bloodPressureSystolic) > 0) {
+      const vEntry: Vitals = {
+        ...newConsult.vitals,
+        id: newConsult.vitals.id || `vit-con-${Date.now()}`,
+        recordedAt: newConsult.vitals.recordedAt || new Date().toISOString(),
+        recordedBy: newConsult.vitals.recordedBy || newConsult.doctorName || 'Attending Physician',
+        recordedById: req.user!.userId,
+        recordedByRole: req.user!.role,
+        appointmentId: newConsult.appointmentId,
+        source: newConsult.vitals.isPatientReported
+          ? 'patient-reported'
+          : newConsult.vitals.source || 'doctor-consultation',
+      };
+      const existing = Array.isArray(memPatients[patIdx].vitalsHistory) ? memPatients[patIdx].vitalsHistory : [];
+      if (!existing.some((v) => v.id && v.id === vEntry.id)) {
+        memPatients[patIdx] = {
+          ...memPatients[patIdx],
+          vitalsHistory: [vEntry, ...existing],
+        };
+      }
+    }
+  }
+
   memConsultations.unshift(newConsult);
 
   // If consultation is linked to an appointment, mark appointment completed
@@ -3240,152 +4094,890 @@ app.post('/api/consultations', (req: Request, res: Response) => {
     const apt = memAppointments.find((a) => a.id === newConsult.appointmentId);
     if (apt) {
       apt.status = 'Completed';
+      apt.completedAt = new Date().toISOString();
+      if (apt.teleconsultStatus) apt.teleconsultStatus = 'Ended';
+      emitToPatient(apt.patientId, 'appointment:updated', { appointment: apt });
     }
     if (supabaseServer) {
-      (async () => {
-        try {
-          await supabaseServer.from('appointments').update({ status: 'Completed' }).eq('id', newConsult.appointmentId);
-        } catch {}
-      })();
+      supabaseServer.from('appointments').update({ status: 'Completed' }).eq('id', newConsult.appointmentId).catch(() => {});
     }
   }
 
+  emitToStaffAndAdmin('consultation:created', { consultation: newConsult });
   flushClinicStateToDisk();
   return res.status(201).json(newConsult);
 });
 
 /* ==========================================================================
-   PRESCRIPTIONS & PHARMACY DISPENSARY
+   PRESCRIPTIONS & ATOMIC PHARMACY DISPENSARY (Phase 8 & Phase 9)
    ========================================================================== */
-app.get('/api/prescriptions', (req: AuthenticatedRequest, res: Response) => {
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+app.get('/api/prescriptions', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  const isPatient = actorRole === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
 
-  if (isPatient && linkedId) {
-    const patient = memPatients.find((p) => p.id === linkedId);
-    return res.json(
-      memPrescriptions.filter(
-        (rx) => rx.patientId === linkedId || (patient && rx.patientName === patient.fullName)
-      )
-    );
+  if (isPatient) {
+    if (!linkedId) return res.json([]);
+    return res.json(memPrescriptions.filter((rx) => rx.patientId === linkedId));
+  }
+  if (!['admin', 'doctor', 'pharmacist', 'nurse'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' is not authorized to read prescriptions.` });
   }
   return res.json(memPrescriptions);
 });
 
-app.post('/api/prescriptions', (req: Request, res: Response) => {
-  const newRx = req.body;
-  if (!newRx.id) newRx.id = `rx-${Date.now()}`;
-  if (!newRx.prescriptionNumber) newRx.prescriptionNumber = `RX-2026-${String(memPrescriptions.length + 101).padStart(3, '0')}`;
+// Phase 8 & 9.3: Only authorized doctors/admin create prescriptions; NEVER deduct physical stock on creation!
+app.post('/api/prescriptions', requireVerifiedRoles('admin', 'doctor'), (req: AuthenticatedRequest, res: Response) => {
+  const rawRx = req.body || {};
+  if (!rawRx.patientId) {
+    return res.status(400).json({ error: 'Patient selection is required to issue an electronic prescription.' });
+  }
+  if (!Array.isArray(rawRx.items) || rawRx.items.length === 0) {
+    return res.status(400).json({ error: 'At least one medication item is required.' });
+  }
+
+  const docRecord = memUsers.find((u) => u.id === (rawRx.doctorId || req.user!.userId));
+  const patRecord = memPatients.find((p) => p.id === rawRx.patientId);
+  const rxId = rawRx.id || `rx-${Date.now()}`;
+  const rxNumber = rawRx.prescriptionNumber || `RX-2026-${String(memPrescriptions.length + 101).padStart(3, '0')}`;
+
+  const normalizedItems = rawRx.items.map((it: any, idx: number) => {
+    const qty = Math.max(1, Math.round(Number(it.quantity) || 1));
+    const matchedInv = memInventory.find(
+      (inv) =>
+        (it.inventoryItemId && inv.id === it.inventoryItemId) ||
+        inv.name.toLowerCase() === String(it.medicationName || '').trim().toLowerCase()
+    );
+    return {
+      id: it.id || `${rxId}-item-${idx + 1}`,
+      inventoryItemId: it.inventoryItemId || matchedInv?.id,
+      medicationName: String(it.medicationName || '').trim(),
+      genericName: String(it.genericName || matchedInv?.genericName || '').trim(),
+      dosage: String(it.dosage || '').trim(),
+      frequency: String(it.frequency || '').trim(),
+      route: it.route || 'Oral',
+      duration: String(it.duration || '').trim(),
+      quantity: qty,
+      dispensedQuantity: 0,
+      remainingQuantity: qty,
+      instructions: String(it.instructions || '').trim(),
+      dispensed: false,
+    };
+  });
+
+  const newRx = {
+    ...rawRx,
+    id: rxId,
+    prescriptionNumber: rxNumber,
+    patientId: rawRx.patientId,
+    patientName: rawRx.patientName || patRecord?.fullName || 'Outpatient',
+    patientMrn: rawRx.patientMrn || patRecord?.mrn || 'MRN-PENDING',
+    patientAge: Number(rawRx.patientAge ?? patRecord?.age ?? 30),
+    patientGender: rawRx.patientGender || patRecord?.gender || 'Other',
+    doctorId: docRecord?.id || rawRx.doctorId || req.user!.userId,
+    doctorName: docRecord?.name || rawRx.doctorName || req.user!.name,
+    doctorSpecialty: docRecord?.specialty || rawRx.doctorSpecialty || 'General Medicine',
+    doctorLicense: docRecord?.licenseNumber || rawRx.doctorLicense || 'DEMO-MD-VERIFIED',
+    branch: rawRx.branch || 'Main Outpatient Clinic',
+    date: rawRx.date || new Date().toISOString().split('T')[0],
+    items: normalizedItems,
+    status: 'Active' as const,
+  };
+
   memPrescriptions.unshift(newRx);
+
+  memAuditLogs.unshift({
+    id: `aud-${Date.now()}`,
+    timestamp: new Date().toISOString(),
+    userId: req.user!.userId,
+    userName: newRx.doctorName,
+    userRole: req.user!.role,
+    action: 'PRESCRIPTION_ISSUED',
+    resourceType: 'Prescription',
+    resourceId: newRx.id,
+    description: `Issued e-Prescription ${newRx.prescriptionNumber} for ${newRx.patientName} (${normalizedItems.length} item(s)). Physical stock unchanged pending pharmacist dispensing.`,
+    ipAddress: String(req.ip || '127.0.0.1'),
+  });
+
+  createAndPersistNotification({
+    recipientId: newRx.patientId,
+    patientId: newRx.patientId,
+    recipientRole: 'patient',
+    targetRole: 'patient',
+    title: 'New Electronic Prescription Issued',
+    message: `${newRx.doctorName} issued prescription ${newRx.prescriptionNumber}. View or print in your Patient Portal.`,
+    category: 'prescription',
+    priority: 'normal',
+    relatedResourceId: newRx.id,
+    relatedResourceType: 'prescription',
+  }).catch(() => {});
+
+  createAndPersistNotification({
+    recipientRole: 'pharmacist',
+    targetRole: 'provider',
+    title: `Incoming Prescription ${newRx.prescriptionNumber}`,
+    message: `${newRx.doctorName} prescribed ${normalizedItems.map((i: any) => `${i.medicationName} x${i.quantity}`).join(', ')} for ${newRx.patientName}.`,
+    category: 'prescription',
+    priority: 'normal',
+    relatedResourceId: newRx.id,
+    relatedResourceType: 'prescription',
+  }).catch(() => {});
+
+  emitToStaffAndAdmin('prescription:created', { prescription: newRx });
+  emitToPatient(newRx.patientId, 'prescription:created', { prescription: newRx });
   flushClinicStateToDisk();
   return res.status(201).json(newRx);
 });
 
-app.patch('/api/prescriptions/:id', (req: Request, res: Response) => {
+// Phase 9.3: Atomic Pharmacist Dispensing Endpoint (Full & Partial Dispensing, Duplicate & Negative Stock Protection)
+app.post('/api/prescriptions/:id/dispense', requireVerifiedRoles('admin', 'pharmacist'), (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const rxIdx = memPrescriptions.findIndex((r) => r.id === id);
+  if (rxIdx === -1) return res.status(404).json({ error: 'Prescription not found.' });
+
+  const rx = memPrescriptions[rxIdx];
+  if (rx.status === 'Dispensed') {
+    return res.status(409).json({
+      error: `Duplicate dispensing blocked: Prescription ${rx.prescriptionNumber} has already been fully dispensed.`,
+    });
+  }
+  if (rx.status === 'Discontinued') {
+    return res.status(400).json({ error: `Cannot dispense discontinued prescription ${rx.prescriptionNumber}.` });
+  }
+
+  const requestedItems: Array<{ itemId: string; quantityToDispense?: number }> | undefined = Array.isArray(req.body?.items)
+    ? req.body.items
+    : undefined;
+  const notes = req.body?.notes ? String(req.body.notes).trim() : undefined;
+
+  // Stage 1: Validate all requested items and inventory stock BEFORE mutating any quantities (atomic check)
+  interface StagedDispenseOp {
+    rxItemIndex: number;
+    invIndex: number;
+    qtyToDispense: number;
+  }
+  const stagedOps: StagedDispenseOp[] = [];
+
+  for (let idx = 0; idx < rx.items.length; idx++) {
+    const rxItem = rx.items[idx];
+    const alreadyDispensed = Number(rxItem.dispensedQuantity || (rxItem.dispensed ? rxItem.quantity : 0));
+    const remaining = Math.max(0, Number(rxItem.remainingQuantity ?? rxItem.quantity - alreadyDispensed));
+
+    let qtyToDispense = 0;
+    if (requestedItems && requestedItems.length > 0) {
+      const matchReq = requestedItems.find((ri) => ri.itemId === rxItem.id);
+      if (!matchReq) continue;
+      qtyToDispense = Math.round(Number(matchReq.quantityToDispense ?? remaining));
+    } else {
+      qtyToDispense = remaining;
+    }
+
+    if (qtyToDispense <= 0) continue;
+
+    if (qtyToDispense > remaining) {
+      return res.status(409).json({
+        error: `Cannot dispense ${qtyToDispense} unit(s) of ${rxItem.medicationName}; only ${remaining} unit(s) remain undispensed on this prescription.`,
+      });
+    }
+
+    const invIdx = memInventory.findIndex(
+      (inv) =>
+        (rxItem.inventoryItemId && inv.id === rxItem.inventoryItemId) ||
+        inv.name.toLowerCase() === rxItem.medicationName.toLowerCase() ||
+        (rxItem.genericName &&
+          inv.genericName.toLowerCase() === rxItem.genericName.toLowerCase() &&
+          inv.name.toLowerCase().includes(rxItem.dosage.toLowerCase()))
+    );
+
+    if (invIdx === -1) {
+      return res.status(409).json({
+        error: `Medication '${rxItem.medicationName}' is not linked to an active clinic inventory SKU. Verify stock item before dispensing.`,
+      });
+    }
+
+    if (memInventory[invIdx].stockQuantity < qtyToDispense) {
+      return res.status(409).json({
+        error: `Insufficient physical stock for ${memInventory[invIdx].name}: available ${memInventory[invIdx].stockQuantity} ${memInventory[invIdx].unit}, requested ${qtyToDispense}. Negative inventory is prohibited.`,
+        availableStock: memInventory[invIdx].stockQuantity,
+        medicationName: memInventory[invIdx].name,
+      });
+    }
+
+    stagedOps.push({ rxItemIndex: idx, invIndex: invIdx, qtyToDispense });
+  }
+
+  if (stagedOps.length === 0) {
+    return res.status(409).json({
+      error: 'No remaining undispensed medication quantities selected for dispensing.',
+    });
+  }
+
+  // Stage 2: Commit stock deductions, transaction ledger entries, and prescription item updates atomically
+  const nowIso = new Date().toISOString();
+  const actorName = req.user?.name || 'Clinical Pharmacist';
+  const createdTransactions: InventoryTransaction[] = [];
+  const lowStockTriggered: string[] = [];
+
+  const updatedRxItems = rx.items.map((it) => ({ ...it }));
+  for (const op of stagedOps) {
+    const invItem = memInventory[op.invIndex];
+    const rxItem = updatedRxItems[op.rxItemIndex];
+    const prevStock = invItem.stockQuantity;
+    const nextStock = prevStock - op.qtyToDispense;
+
+    invItem.stockQuantity = nextStock;
+    invItem.lastUpdated = nowIso;
+
+    const prevDispensed = Number(rxItem.dispensedQuantity || (rxItem.dispensed ? rxItem.quantity : 0));
+    const nextDispensed = prevDispensed + op.qtyToDispense;
+    const nextRemaining = Math.max(0, rxItem.quantity - nextDispensed);
+
+    rxItem.inventoryItemId = invItem.id;
+    rxItem.dispensedQuantity = nextDispensed;
+    rxItem.remainingQuantity = nextRemaining;
+    rxItem.dispensed = nextRemaining === 0;
+    rxItem.dispensedAt = nowIso;
+    rxItem.dispensedBy = actorName;
+
+    const tx: InventoryTransaction = {
+      id: `itx-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      inventoryItemId: invItem.id,
+      sku: invItem.sku,
+      medicationName: invItem.name,
+      type: 'DISPENSE',
+      quantityDelta: -op.qtyToDispense,
+      previousStock: prevStock,
+      newStock: nextStock,
+      prescriptionId: rx.id,
+      prescriptionNumber: rx.prescriptionNumber,
+      prescriptionItemId: rxItem.id,
+      patientId: rx.patientId,
+      patientName: rx.patientName,
+      performedById: req.user!.userId,
+      performedByName: actorName,
+      branch: invItem.branch || rx.branch || 'Main Outpatient Clinic',
+      notes: notes || `Dispensed against ${rx.prescriptionNumber}`,
+      timestamp: nowIso,
+    };
+    memInventoryTransactions.unshift(tx);
+    createdTransactions.push(tx);
+
+    if (nextStock <= invItem.reorderLevel) {
+      lowStockTriggered.push(`${invItem.name} (${nextStock} ${invItem.unit} remaining; reorder threshold ${invItem.reorderLevel})`);
+    }
+  }
+
+  const allDispensed = updatedRxItems.every((it) => {
+    const rem = it.remainingQuantity ?? (it.dispensed ? 0 : it.quantity);
+    return rem <= 0;
+  });
+
+  memPrescriptions[rxIdx] = {
+    ...rx,
+    items: updatedRxItems,
+    status: allDispensed ? 'Dispensed' : 'Partially Dispensed',
+    dispensedAt: nowIso,
+    dispensedBy: actorName,
+  };
+
+  memAuditLogs.unshift({
+    id: `aud-${Date.now()}`,
+    timestamp: nowIso,
+    userId: req.user!.userId,
+    userName: actorName,
+    userRole: req.user!.role,
+    action: allDispensed ? 'PRESCRIPTION_DISPENSED' : 'PRESCRIPTION_PARTIALLY_DISPENSED',
+    resourceType: 'Prescription',
+    resourceId: rx.id,
+    description: `${actorName} dispensed ${createdTransactions.map((t) => `${t.medicationName} (${Math.abs(t.quantityDelta)})`).join(', ')} for ${rx.patientName} (${rx.prescriptionNumber}).`,
+    ipAddress: String(req.ip || '127.0.0.1'),
+  });
+
+  if (lowStockTriggered.length > 0) {
+    createAndPersistNotification({
+      recipientRole: 'pharmacist',
+      targetRole: 'admin',
+      title: 'Low Stock — Replenishment Recommended',
+      message: `Stock reached or fell below reorder threshold: ${lowStockTriggered.join('; ')}.`,
+      category: 'inventory',
+      priority: 'high',
+      relatedResourceId: rx.id,
+      relatedResourceType: 'inventory',
+    }).catch(() => {});
+  }
+
+  createAndPersistNotification({
+    recipientId: rx.patientId,
+    patientId: rx.patientId,
+    recipientRole: 'patient',
+    targetRole: 'patient',
+    title: allDispensed ? 'Medication Dispensed' : 'Medication Partially Dispensed',
+    message: `Prescription ${rx.prescriptionNumber} has been ${allDispensed ? 'dispensed' : 'partially dispensed'} by SmartClinic Pharmacy.`,
+    category: 'prescription',
+    priority: 'normal',
+    relatedResourceId: rx.id,
+    relatedResourceType: 'prescription',
+  }).catch(() => {});
+
+  emitToStaffAndAdmin('inventory:updated', {
+    prescription: memPrescriptions[rxIdx],
+    transactions: createdTransactions,
+    inventory: memInventory,
+  });
+  emitToPatient(rx.patientId, 'prescription:updated', { prescription: memPrescriptions[rxIdx] });
+  flushClinicStateToDisk();
+
+  return res.json({
+    success: true,
+    prescription: memPrescriptions[rxIdx],
+    transactions: createdTransactions,
+    lowStockAlerts: lowStockTriggered,
+    inventory: memInventory,
+  });
+});
+
+app.patch('/api/prescriptions/:id', requireVerifiedRoles('admin', 'doctor', 'pharmacist'), (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const rxIdx = memPrescriptions.findIndex((r) => r.id === id);
   if (rxIdx === -1) return res.status(404).json({ error: 'Prescription not found' });
-  const updates = req.body || {};
+  const updates = { ...(req.body || {}) };
+  // Guard against bypassing atomic dispensing via generic PATCH
+  if (updates.status === 'Dispensed' && memPrescriptions[rxIdx].status !== 'Dispensed') {
+    return res.status(400).json({
+      error: 'Use POST /api/prescriptions/:id/dispense so medicine stock is verified and deducted atomically.',
+    });
+  }
   memPrescriptions[rxIdx] = { ...memPrescriptions[rxIdx], ...updates };
   flushClinicStateToDisk();
   return res.json({ success: true, prescription: memPrescriptions[rxIdx] });
 });
 
 /* ==========================================================================
-   DIAGNOSTIC PATHOLOGY & LABORATORY
+   DIAGNOSTIC PATHOLOGY & 6-STEP LABORATORY WORKFLOW (Phase 10)
    ========================================================================== */
-app.get('/api/lab-orders', (req: AuthenticatedRequest, res: Response) => {
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+const FINAL_RELEASED_LAB_STATUSES = new Set<string>([
+  'Verified',
+  'Released',
+  'Result Available',
+  'Reviewed',
+  'Completed',
+]);
 
-  if (isPatient && linkedId) {
-    const patient = memPatients.find((p) => p.id === linkedId);
+function redactLabOrderForPatient(order: LabTestOrder): LabTestOrder {
+  const isFinalReleased = FINAL_RELEASED_LAB_STATUSES.has(order.status) && !order.isPreliminary;
+  if (isFinalReleased) {
+    return order;
+  }
+  return {
+    ...order,
+    results: [],
+    interpretation: undefined,
+    aiSummary: undefined,
+  };
+}
+
+app.get('/api/lab-orders', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  const isPatient = actorRole === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
+
+  if (isPatient) {
+    if (!linkedId) return res.json([]);
     return res.json(
-      memLabOrders.filter(
-        (o) => o.patientId === linkedId || (patient && o.patientName === patient.fullName)
-      )
+      memLabOrders
+        .filter((o) => o.patientId === linkedId)
+        .map(redactLabOrderForPatient)
     );
+  }
+  if (!['admin', 'doctor', 'nurse', 'lab_technician'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' is not authorized to read diagnostic lab orders.` });
   }
   return res.json(memLabOrders);
 });
 
-app.post('/api/lab-orders', (req: Request, res: Response) => {
-  const newOrder = req.body;
-  if (!newOrder.id) newOrder.id = `lab-${Date.now()}`;
-  if (!newOrder.orderNumber) newOrder.orderNumber = `LAB-2026-${String(memLabOrders.length + 1001)}`;
+app.post('/api/lab-orders', requireVerifiedRoles('admin', 'doctor'), (req: AuthenticatedRequest, res: Response) => {
+  const rawOrder = req.body || {};
+  if (!rawOrder.patientId || !rawOrder.testName) {
+    return res.status(400).json({ error: 'Patient and requested laboratory examination name are required.' });
+  }
+  const patRecord = memPatients.find((p) => p.id === rawOrder.patientId);
+  const nowIso = new Date().toISOString();
+  const newOrder: LabTestOrder = {
+    ...rawOrder,
+    id: rawOrder.id || `lab-${Date.now()}`,
+    orderNumber: rawOrder.orderNumber || `LAB-2026-${String(memLabOrders.length + 1001)}`,
+    patientId: rawOrder.patientId,
+    patientName: rawOrder.patientName || patRecord?.fullName || 'Outpatient',
+    patientMrn: rawOrder.patientMrn || patRecord?.mrn || 'MRN-PENDING',
+    doctorId: rawOrder.doctorId || req.user!.userId,
+    doctorName: rawOrder.doctorName || req.user!.name,
+    branch: rawOrder.branch || 'Main Outpatient Clinic',
+    testName: String(rawOrder.testName).trim(),
+    category: rawOrder.category || 'Hematology',
+    urgency: rawOrder.urgency || 'Routine',
+    status: 'Requested',
+    requestedAt: rawOrder.requestedAt || nowIso,
+    isPreliminary: true,
+    results: [],
+  };
   memLabOrders.unshift(newOrder);
+
+  memAuditLogs.unshift({
+    id: `aud-${Date.now()}`,
+    timestamp: nowIso,
+    userId: req.user!.userId,
+    userName: newOrder.doctorName,
+    userRole: req.user!.role,
+    action: 'LAB_ORDER_REQUESTED',
+    resourceType: 'Laboratory',
+    resourceId: newOrder.id,
+    description: `${newOrder.doctorName} requested ${newOrder.testName} (${newOrder.urgency}) for ${newOrder.patientName} (${newOrder.orderNumber}).`,
+    ipAddress: String(req.ip || '127.0.0.1'),
+  });
+
+  createAndPersistNotification({
+    recipientRole: 'lab_technician',
+    targetRole: 'provider',
+    title: `New Lab Request: ${newOrder.orderNumber}`,
+    message: `${newOrder.doctorName} ordered ${newOrder.testName} (${newOrder.urgency}) for ${newOrder.patientName}.`,
+    category: 'lab',
+    priority: newOrder.urgency === 'STAT' ? 'urgent' : 'normal',
+    relatedResourceId: newOrder.id,
+    relatedResourceType: 'lab_order',
+  }).catch(() => {});
+
+  emitToStaffAndAdmin('lab:updated', { labOrder: newOrder, action: 'requested' });
   flushClinicStateToDisk();
   return res.status(201).json(newOrder);
 });
 
-app.patch('/api/lab-orders/:id', (req: Request, res: Response) => {
+// Phase 10.2: 6-Step Laboratory Workflow Endpoint
+app.patch(
+  '/api/lab-orders/:id/workflow',
+  requireVerifiedRoles('admin', 'lab_technician', 'nurse', 'doctor'),
+  (req: AuthenticatedRequest, res: Response) => {
+    const { id } = req.params;
+    const orderIdx = memLabOrders.findIndex((o) => o.id === id);
+    if (orderIdx === -1) return res.status(404).json({ error: 'Laboratory order not found.' });
+
+    const actorRole = req.user!.role;
+    const actorName = req.user?.name || 'Laboratory Personnel';
+    const action = String(req.body?.action || '').trim();
+    const nowIso = new Date().toISOString();
+    const order = { ...memLabOrders[orderIdx] };
+
+    if (action === 'verify-patient') {
+      if (!['admin', 'lab_technician', 'nurse'].includes(actorRole)) {
+        return res.status(403).json({ error: 'Only laboratory or nursing staff may verify patients for specimen collection.' });
+      }
+      order.patientVerifiedAt = nowIso;
+      order.patientVerifiedBy = actorName;
+    } else if (action === 'collect-sample') {
+      if (!['admin', 'lab_technician', 'nurse'].includes(actorRole)) {
+        return res.status(403).json({ error: 'Only laboratory or nursing staff may record specimen collection.' });
+      }
+      order.patientVerifiedAt = order.patientVerifiedAt || nowIso;
+      order.patientVerifiedBy = order.patientVerifiedBy || actorName;
+      order.specimenType = String(req.body?.specimenType || order.specimenType || 'Venous Whole Blood / Serum').trim();
+      order.specimenId = String(req.body?.specimenId || order.specimenId || `SPEC-${order.orderNumber.split('-').pop()}`).trim();
+      order.collectedAt = nowIso;
+      order.collectedBy = actorName;
+      order.status = 'Sample Collected';
+      order.isPreliminary = true;
+    } else if (action === 'start-processing') {
+      if (!['admin', 'lab_technician'].includes(actorRole)) {
+        return res.status(403).json({ error: 'Only authorized laboratory personnel may start examination processing.' });
+      }
+      order.collectedAt = order.collectedAt || nowIso;
+      order.collectedBy = order.collectedBy || actorName;
+      order.processedAt = nowIso;
+      order.processedBy = actorName;
+      order.status = 'Processing';
+      order.isPreliminary = true;
+    } else if (action === 'encode-results') {
+      if (!['admin', 'lab_technician'].includes(actorRole)) {
+        return res.status(403).json({ error: 'Only authorized laboratory personnel may encode laboratory findings.' });
+      }
+      const results = Array.isArray(req.body?.results) ? req.body.results : [];
+      if (results.length === 0) {
+        return res.status(400).json({ error: 'At least one measured laboratory parameter is required when encoding findings.' });
+      }
+      order.results = results;
+      order.interpretation = req.body?.interpretation ? String(req.body.interpretation).trim() : order.interpretation;
+      order.notes = req.body?.notes ? String(req.body.notes).trim() : order.notes;
+      order.encodedAt = nowIso;
+      order.encodedBy = actorName;
+      order.status = 'Encoded';
+      order.isPreliminary = true; // Protected from patient view until verified & released!
+    } else if (action === 'verify-and-release') {
+      if (!['admin', 'lab_technician'].includes(actorRole)) {
+        return res.status(403).json({ error: 'Only authorized laboratory personnel or the administrator may verify and release final results.' });
+      }
+      if (Array.isArray(req.body?.results) && req.body.results.length > 0) {
+        order.results = req.body.results;
+      }
+      if (req.body?.interpretation) {
+        order.interpretation = String(req.body.interpretation).trim();
+      }
+      if (!Array.isArray(order.results) || order.results.length === 0) {
+        return res.status(400).json({ error: 'Cannot verify and release a laboratory report with zero encoded findings.' });
+      }
+      order.encodedAt = order.encodedAt || nowIso;
+      order.encodedBy = order.encodedBy || actorName;
+      order.verifiedAt = nowIso;
+      order.verifiedBy = actorName;
+      order.releasedAt = nowIso;
+      order.releasedBy = actorName;
+      order.completedAt = nowIso;
+      order.isPreliminary = false;
+      order.status = 'Released';
+
+      // Notify requesting doctor & patient automatically upon final release
+      if (order.doctorId) {
+        createAndPersistNotification({
+          recipientId: order.doctorId,
+          doctorId: order.doctorId,
+          recipientRole: 'doctor',
+          targetRole: 'provider',
+          title: `Final Lab Result Released: ${order.testName}`,
+          message: `Verified findings for ${order.patientName} (${order.orderNumber}) have been released by ${actorName}.`,
+          category: 'lab',
+          priority: order.results.some((r) => r.flag === 'Critical') ? 'urgent' : 'high',
+          relatedResourceId: order.id,
+          relatedResourceType: 'lab_order',
+        }).catch(() => {});
+      }
+
+      createAndPersistNotification({
+        recipientId: order.patientId,
+        patientId: order.patientId,
+        recipientRole: 'patient',
+        targetRole: 'patient',
+        title: 'Laboratory Result Available',
+        message: `Your verified ${order.testName} report (${order.orderNumber}) has been released and is ready to view or print in your Patient Portal.`,
+        category: 'lab',
+        priority: 'normal',
+        relatedResourceId: order.id,
+        relatedResourceType: 'lab_order',
+      }).catch(() => {});
+
+      emitToPatient(order.patientId, 'lab:released', { labOrder: order });
+    } else if (action === 'amend-result') {
+      if (!['admin', 'lab_technician'].includes(actorRole)) {
+        return res.status(403).json({ error: 'Only authorized laboratory personnel may amend released laboratory results.' });
+      }
+      const reason = String(req.body?.reason || '').trim();
+      if (reason.length < 5) {
+        return res.status(400).json({ error: 'An amendment reason (minimum 5 characters) is required for the audit trail.' });
+      }
+      const previousSummary = (order.results || [])
+        .map((r) => `${r.parameter}: ${r.value} ${r.unit}`)
+        .join('; ');
+      if (Array.isArray(req.body?.results) && req.body.results.length > 0) {
+        order.results = req.body.results;
+      }
+      if (req.body?.interpretation !== undefined) {
+        order.interpretation = String(req.body.interpretation).trim();
+      }
+      const history = Array.isArray(order.amendmentHistory) ? [...order.amendmentHistory] : [];
+      history.unshift({
+        id: `amd-${Date.now()}`,
+        amendedAt: nowIso,
+        amendedBy: actorName,
+        reason,
+        previousSummary,
+      });
+      order.amendmentHistory = history;
+      order.verifiedAt = nowIso;
+      order.verifiedBy = actorName;
+      order.releasedAt = nowIso;
+      order.releasedBy = actorName;
+      order.isPreliminary = false;
+      order.status = 'Released';
+    } else if (action === 'doctor-acknowledge') {
+      if (!['admin', 'doctor'].includes(actorRole)) {
+        return res.status(403).json({ error: 'Only an attending doctor may mark a released result as clinically reviewed.' });
+      }
+      order.status = 'Reviewed';
+      order.isPreliminary = false;
+    } else {
+      return res.status(400).json({ error: `Unsupported laboratory workflow action '${action}'.` });
+    }
+
+    memLabOrders[orderIdx] = order;
+
+    memAuditLogs.unshift({
+      id: `aud-${Date.now()}`,
+      timestamp: nowIso,
+      userId: req.user!.userId,
+      userName: actorName,
+      userRole: actorRole,
+      action: `LAB_WORKFLOW_${action.toUpperCase().replace(/-/g, '_')}`,
+      resourceType: 'Laboratory',
+      resourceId: order.id,
+      description: `${actorName} performed '${action}' on ${order.orderNumber} (${order.testName}) for ${order.patientName}. Status: ${order.status}.`,
+      ipAddress: String(req.ip || '127.0.0.1'),
+    });
+
+    emitToStaffAndAdmin('lab:updated', { labOrder: order, action });
+    flushClinicStateToDisk();
+    return res.json({ success: true, labOrder: order });
+  }
+);
+
+app.patch('/api/lab-orders/:id', requireVerifiedRoles('admin', 'doctor', 'nurse', 'lab_technician'), (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const orderIdx = memLabOrders.findIndex((o) => o.id === id);
   if (orderIdx === -1) return res.status(404).json({ error: 'Lab order not found' });
-  const updates = req.body || {};
+  const updates = { ...(req.body || {}) };
+  const actorRole = req.user!.role;
+
+  // Only lab_technician or admin may release final results
+  if (
+    updates.status &&
+    FINAL_RELEASED_LAB_STATUSES.has(updates.status) &&
+    !['admin', 'lab_technician'].includes(actorRole) &&
+    !(updates.status === 'Reviewed' && actorRole === 'doctor')
+  ) {
+    return res.status(403).json({
+      error: 'Only authorized laboratory personnel may verify and release final laboratory results.',
+    });
+  }
+
+  if (updates.status && FINAL_RELEASED_LAB_STATUSES.has(updates.status) && ['admin', 'lab_technician'].includes(actorRole)) {
+    const nowIso = new Date().toISOString();
+    updates.isPreliminary = false;
+    updates.verifiedAt = updates.verifiedAt || nowIso;
+    updates.verifiedBy = updates.verifiedBy || req.user?.name || 'Lab Technologist';
+    updates.releasedAt = updates.releasedAt || nowIso;
+    updates.releasedBy = updates.releasedBy || req.user?.name || 'Lab Technologist';
+  }
+
   memLabOrders[orderIdx] = { ...memLabOrders[orderIdx], ...updates };
   flushClinicStateToDisk();
   return res.json({ success: true, labOrder: memLabOrders[orderIdx] });
 });
 
 /* ==========================================================================
-   PHARMACY INVENTORY & STOCK
+   PHARMACY INVENTORY, REORDER THRESHOLDS & RESTOCK REQUESTS (Phase 9)
    ========================================================================== */
-app.get('/api/inventory', (_req: Request, res: Response) => {
+app.get('/api/inventory', requireVerifiedRoles('admin', 'pharmacist', 'doctor', 'nurse'), (_req: AuthenticatedRequest, res: Response) => {
   return res.json(memInventory);
 });
 
-app.post('/api/inventory/adjust', (req: AuthenticatedRequest, res: Response) => {
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  if (isPatient) {
-    return res.status(403).json({ error: 'Patients do not have permission to adjust medication inventory.' });
+app.get('/api/inventory/transactions', requireVerifiedRoles('admin', 'pharmacist'), (_req: AuthenticatedRequest, res: Response) => {
+  return res.json(memInventoryTransactions);
+});
+
+app.patch('/api/inventory/:id/threshold', requireVerifiedRoles('admin', 'pharmacist'), (req: AuthenticatedRequest, res: Response) => {
+  const item = memInventory.find((i) => i.id === req.params.id);
+  if (!item) return res.status(404).json({ error: 'Inventory item not found.' });
+  const nextThreshold = Math.max(0, Math.round(Number(req.body?.reorderLevel)));
+  if (!Number.isFinite(nextThreshold)) {
+    return res.status(400).json({ error: 'Valid non-negative reorderLevel is required.' });
+  }
+  item.reorderLevel = nextThreshold;
+  item.lastUpdated = new Date().toISOString();
+  flushClinicStateToDisk();
+  return res.json({ success: true, item });
+});
+
+app.get('/api/inventory/restock-requests', requireVerifiedRoles('admin', 'pharmacist'), (_req: AuthenticatedRequest, res: Response) => {
+  return res.json(memRestockRequests);
+});
+
+app.post('/api/inventory/restock-requests', requireVerifiedRoles('admin', 'pharmacist'), (req: AuthenticatedRequest, res: Response) => {
+  const { inventoryItemId, requestedQuantity, notes, supplier } = req.body || {};
+  const item = memInventory.find((i) => i.id === inventoryItemId);
+  if (!item) return res.status(404).json({ error: 'Inventory item not found.' });
+  const qty = Math.max(1, Math.round(Number(requestedQuantity) || item.reorderLevel * 2 || 50));
+  const nowIso = new Date().toISOString();
+  const actorName = req.user?.name || 'Pharmacist';
+
+  const restockReq: RestockRequest = {
+    id: `rst-${Date.now()}`,
+    requestNumber: `RST-2026-${String(memRestockRequests.length + 101).padStart(3, '0')}`,
+    inventoryItemId: item.id,
+    sku: item.sku,
+    medicationName: item.name,
+    currentStock: item.stockQuantity,
+    reorderLevel: item.reorderLevel,
+    requestedQuantity: qty,
+    unit: item.unit,
+    supplier: supplier ? String(supplier).trim() : item.supplier,
+    branch: item.branch || 'Main Outpatient Clinic',
+    status: 'Pending Approval',
+    requestedById: req.user!.userId,
+    requestedByName: actorName,
+    requestedAt: nowIso,
+    notes: notes ? String(notes).trim() : 'Internal replenishment request (no external supplier order placed automatically).',
+  };
+
+  memRestockRequests.unshift(restockReq);
+  memAuditLogs.unshift({
+    id: `aud-${Date.now()}`,
+    timestamp: nowIso,
+    userId: req.user!.userId,
+    userName: actorName,
+    userRole: req.user!.role,
+    action: 'RESTOCK_REQUEST_CREATED',
+    resourceType: 'Inventory',
+    resourceId: restockReq.id,
+    description: `${actorName} created internal restock request ${restockReq.requestNumber} for ${item.name} (${qty} ${item.unit}).`,
+    ipAddress: String(req.ip || '127.0.0.1'),
+  });
+
+  flushClinicStateToDisk();
+  emitToStaffAndAdmin('inventory:restock_requested', { restockRequest: restockReq });
+  return res.status(201).json({ success: true, restockRequest: restockReq });
+});
+
+app.patch('/api/inventory/restock-requests/:id', requireVerifiedRoles('admin', 'pharmacist'), (req: AuthenticatedRequest, res: Response) => {
+  const reqIdx = memRestockRequests.findIndex((r) => r.id === req.params.id);
+  if (reqIdx === -1) return res.status(404).json({ error: 'Restock request not found.' });
+
+  const action = String(req.body?.action || '').trim();
+  const restock = { ...memRestockRequests[reqIdx] };
+  const nowIso = new Date().toISOString();
+  const actorName = req.user?.name || 'Pharmacist';
+
+  if (restock.status === 'Received') {
+    return res.status(409).json({ error: `Restock request ${restock.requestNumber} has already been received into inventory.` });
   }
 
+  if (action === 'approve') {
+    restock.status = 'Approved';
+  } else if (action === 'cancel') {
+    restock.status = 'Cancelled';
+  } else if (action === 'receive') {
+    const item = memInventory.find((i) => i.id === restock.inventoryItemId);
+    if (!item) return res.status(404).json({ error: 'Linked inventory item not found.' });
+    const receivedQty = Math.max(1, Math.round(Number(req.body?.receivedQuantity) || restock.requestedQuantity));
+    const prevStock = item.stockQuantity;
+    const nextStock = prevStock + receivedQty;
+    item.stockQuantity = nextStock;
+    if (req.body?.batchNumber) item.batchNumber = String(req.body.batchNumber).trim();
+    if (req.body?.expirationDate) item.expirationDate = String(req.body.expirationDate).trim();
+    item.lastUpdated = nowIso;
+
+    restock.status = 'Received';
+    restock.fulfilledAt = nowIso;
+    restock.fulfilledByName = actorName;
+
+    const tx: InventoryTransaction = {
+      id: `itx-${Date.now()}-rst`,
+      inventoryItemId: item.id,
+      sku: item.sku,
+      medicationName: item.name,
+      type: 'RESTOCK',
+      quantityDelta: receivedQty,
+      previousStock: prevStock,
+      newStock: nextStock,
+      performedById: req.user!.userId,
+      performedByName: actorName,
+      branch: item.branch || restock.branch,
+      notes: `Received against restock request ${restock.requestNumber}`,
+      timestamp: nowIso,
+    };
+    memInventoryTransactions.unshift(tx);
+
+    memAuditLogs.unshift({
+      id: `aud-${Date.now()}`,
+      timestamp: nowIso,
+      userId: req.user!.userId,
+      userName: actorName,
+      userRole: req.user!.role,
+      action: 'INVENTORY_RESTOCK_RECEIVED',
+      resourceType: 'Inventory',
+      resourceId: item.id,
+      description: `Received +${receivedQty} ${item.unit} of ${item.name} (${restock.requestNumber}). Stock: ${prevStock} -> ${nextStock}.`,
+      ipAddress: String(req.ip || '127.0.0.1'),
+    });
+
+    emitToStaffAndAdmin('inventory:updated', { inventory: memInventory, restockRequest: restock });
+  } else {
+    return res.status(400).json({ error: "Action must be 'approve', 'receive', or 'cancel'." });
+  }
+
+  memRestockRequests[reqIdx] = restock;
+  flushClinicStateToDisk();
+  return res.json({ success: true, restockRequest: restock, inventory: memInventory });
+});
+
+app.post('/api/inventory/adjust', requireVerifiedRoles('admin', 'pharmacist'), (req: AuthenticatedRequest, res: Response) => {
   const { itemId, quantityChange, reason } = req.body || {};
   const item = memInventory.find((i) => i.id === itemId);
   if (!item) return res.status(404).json({ error: 'Inventory item not found.' });
 
-  item.stockQuantity = Math.max(0, item.stockQuantity + Number(quantityChange || 0));
-  item.lastUpdated = new Date().toISOString();
+  const delta = Math.round(Number(quantityChange || 0));
+  if (item.stockQuantity + delta < 0) {
+    return res.status(409).json({
+      error: `Cannot reduce ${item.name} below zero (current: ${item.stockQuantity}, delta: ${delta}).`,
+    });
+  }
 
-  // Record audited stock adjustment
+  const prevStock = item.stockQuantity;
+  const nextStock = prevStock + delta;
+  const nowIso = new Date().toISOString();
+  item.stockQuantity = nextStock;
+  item.lastUpdated = nowIso;
+
+  const actorName = req.user!.name || 'Pharmacist';
+  const tx: InventoryTransaction = {
+    id: `itx-${Date.now()}-adj`,
+    inventoryItemId: item.id,
+    sku: item.sku,
+    medicationName: item.name,
+    type: delta >= 0 ? 'RESTOCK' : 'ADJUSTMENT',
+    quantityDelta: delta,
+    previousStock: prevStock,
+    newStock: nextStock,
+    performedById: req.user!.userId,
+    performedByName: actorName,
+    branch: item.branch || 'Main Outpatient Clinic',
+    notes: reason || 'Manual stock adjustment',
+    timestamp: nowIso,
+  };
+  memInventoryTransactions.unshift(tx);
+
   const auditLog = {
     id: `aud-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    userId: req.user?.userId || 'pharmacist-1',
-    userName: req.user?.name || 'Pharmacist',
-    userRole: (req.userRole || 'pharmacist') as any,
+    timestamp: nowIso,
+    userId: req.user!.userId,
+    userName: actorName,
+    userRole: req.user!.role as any,
     action: 'INVENTORY_STOCK_ADJUST',
     resourceType: 'Inventory' as const,
     resourceId: item.id,
-    description: `Adjusted ${item.name} stock by ${quantityChange} (${reason || 'Standard Adjustment'}). New stock: ${item.stockQuantity}`,
-    ipAddress: '127.0.0.1',
+    description: `Adjusted ${item.name} stock by ${delta} (${reason || 'Standard Adjustment'}). New stock: ${item.stockQuantity}`,
+    ipAddress: String(req.ip || '127.0.0.1'),
   };
   memAuditLogs.unshift(auditLog);
+  emitToStaffAndAdmin('inventory:updated', { inventory: memInventory, item, transaction: tx });
   flushClinicStateToDisk();
 
-  return res.json({ success: true, item, auditLog });
+  return res.json({ success: true, item, transaction: tx, auditLog });
 });
 
 /* ==========================================================================
    BILLING & INVOICING
    ========================================================================== */
-app.get('/api/invoices', (req: AuthenticatedRequest, res: Response) => {
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+app.get('/api/invoices', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  const isPatient = actorRole === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
 
-  if (isPatient && linkedId) {
-    const patient = memPatients.find((p) => p.id === linkedId);
-    return res.json(
-      memInvoices.filter(
-        (i) => i.patientId === linkedId || (patient && i.patientName === patient.fullName)
-      )
-    );
+  if (isPatient) {
+    if (!linkedId) return res.json([]);
+    return res.json(memInvoices.filter((i) => i.patientId === linkedId));
+  }
+  if (!['admin', 'receptionist'].includes(actorRole)) {
+    return res.status(403).json({ error: `Forbidden: Role '${actorRole}' is not authorized to read billing invoices.` });
   }
   return res.json(memInvoices);
 });
 
-app.post('/api/invoices', (req: Request, res: Response) => {
+app.post('/api/invoices', requireVerifiedRoles('admin', 'receptionist'), (req: AuthenticatedRequest, res: Response) => {
   const newInv = req.body;
   if (!newInv.id) newInv.id = `inv-${Date.now()}`;
   if (!newInv.invoiceNumber) newInv.invoiceNumber = `INV-2026-${String(memInvoices.length + 5001)}`;
@@ -3394,7 +4986,7 @@ app.post('/api/invoices', (req: Request, res: Response) => {
   return res.status(201).json(newInv);
 });
 
-app.patch('/api/invoices/:id', (req: Request, res: Response) => {
+app.patch('/api/invoices/:id', requireVerifiedRoles('admin', 'receptionist'), (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const invIdx = memInvoices.findIndex((i) => i.id === id);
   if (invIdx === -1) return res.status(404).json({ error: 'Invoice not found' });
@@ -3405,26 +4997,484 @@ app.patch('/api/invoices/:id', (req: Request, res: Response) => {
 });
 
 /* ==========================================================================
-   AUDIT LOGS & COMPLIANCE (Protected: Staff / Admin only)
+   PRIVATE WEBRTC ONLINE CONSULTATION SIGNALING (Phase 7)
+   Strictly authorizes ONLY the appointment's patientId and assigned doctorId.
+   Never records audio or video streams.
    ========================================================================== */
-app.get('/api/audit-logs', (req: AuthenticatedRequest, res: Response) => {
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  if (isPatient) {
-    return res.status(403).json({
-      error: 'Data Isolation Violation: Patients are strictly barred from querying system audit logs (RA 10173).',
+function getAuthorizedTeleconsultParticipant(
+  req: AuthenticatedRequest,
+  apt: Appointment
+): { allowed: boolean; participantRole?: 'patient' | 'doctor'; peerUserId?: string; error?: string } {
+  const actorRole = req.user!.role;
+  const userId = req.user!.userId;
+  const linkedPatientId = req.user?.linkedPatientId || req.linkedPatientId;
+
+  if (apt.status === 'Cancelled' || apt.status === 'No Show') {
+    return { allowed: false, error: `Online consultation session is unavailable because appointment status is '${apt.status}'.` };
+  }
+
+  if (actorRole === 'patient') {
+    if (linkedPatientId && apt.patientId === linkedPatientId) {
+      return { allowed: true, participantRole: 'patient', peerUserId: apt.doctorId };
+    }
+    return { allowed: false, error: 'Forbidden: Only the scheduled patient may join this private online consultation.' };
+  }
+
+  if (actorRole === 'doctor') {
+    if (apt.doctorId === userId) {
+      return { allowed: true, participantRole: 'doctor', peerUserId: apt.patientId };
+    }
+    return { allowed: false, error: 'Forbidden: Only the assigned attending doctor may join this private online consultation.' };
+  }
+
+  return { allowed: false, error: 'Forbidden: Online consultations are private between the patient and assigned physician.' };
+}
+
+function getOrCreateTeleconsultRoom(apt: Appointment): TeleconsultRoomState {
+  let room = memTeleconsultRooms.get(apt.id);
+  if (!room) {
+    room = {
+      appointmentId: apt.id,
+      roomId: apt.teleconsultRoomId || `tc-${apt.id}`,
+      patientOnline: false,
+      doctorOnline: false,
+      status: apt.teleconsultStatus || 'Scheduled',
+      seqCounter: 0,
+      signals: [],
+    };
+    memTeleconsultRooms.set(apt.id, room);
+  }
+  return room;
+}
+
+function buildIceServersConfig(): { iceServers: Array<Record<string, unknown>>; hasTurnConfigured: boolean } {
+  const servers: Array<Record<string, unknown>> = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ];
+  const turnUrl = process.env.WEBRTC_TURN_URL?.trim();
+  const turnUsername = process.env.WEBRTC_TURN_USERNAME?.trim();
+  const turnCredential = process.env.WEBRTC_TURN_CREDENTIAL?.trim();
+  const hasTurnConfigured = Boolean(turnUrl && turnUsername && turnCredential);
+  if (hasTurnConfigured) {
+    servers.push({
+      urls: turnUrl,
+      username: turnUsername,
+      credential: turnCredential,
     });
   }
+  return { iceServers: servers, hasTurnConfigured };
+}
+
+app.get('/api/teleconsult/:appointmentId/session', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const apt = memAppointments.find((a) => a.id === req.params.appointmentId);
+  if (!apt) return res.status(404).json({ error: 'Appointment not found.' });
+
+  const authCheck = getAuthorizedTeleconsultParticipant(req, apt);
+  if (!authCheck.allowed) {
+    return res.status(403).json({ error: authCheck.error });
+  }
+
+  const room = getOrCreateTeleconsultRoom(apt);
+  const ice = buildIceServersConfig();
+  return res.json({
+    success: true,
+    participantRole: authCheck.participantRole,
+    appointment: apt,
+    room: {
+      appointmentId: room.appointmentId,
+      roomId: room.roomId,
+      patientOnline: room.patientOnline,
+      doctorOnline: room.doctorOnline,
+      status: room.status,
+      startedAt: room.startedAt,
+      endedAt: room.endedAt,
+      latestSeq: room.seqCounter,
+    },
+    rtcConfig: {
+      iceServers: ice.iceServers,
+    },
+    hasTurnConfigured: ice.hasTurnConfigured,
+    recordingPolicy: 'NO_AUTOMATIC_RECORDING',
+  });
+});
+
+app.post('/api/teleconsult/:appointmentId/join', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const apt = memAppointments.find((a) => a.id === req.params.appointmentId);
+  if (!apt) return res.status(404).json({ error: 'Appointment not found.' });
+
+  const authCheck = getAuthorizedTeleconsultParticipant(req, apt);
+  if (!authCheck.allowed || !authCheck.participantRole) {
+    return res.status(403).json({ error: authCheck.error });
+  }
+
+  const nowIso = new Date().toISOString();
+  const room = getOrCreateTeleconsultRoom(apt);
+  if (authCheck.participantRole === 'patient') {
+    room.patientOnline = true;
+    room.patientJoinedAt = nowIso;
+  } else {
+    room.doctorOnline = true;
+    room.doctorJoinedAt = nowIso;
+  }
+
+  if (room.patientOnline && room.doctorOnline) {
+    room.status = 'Active';
+    room.startedAt = room.startedAt || nowIso;
+    if (apt.status === 'Confirmed' || apt.status === 'Scheduled' || apt.status === 'Checked In') {
+      apt.status = 'In Consultation';
+      apt.consultationStartedAt = apt.consultationStartedAt || nowIso;
+    }
+  } else if (room.status !== 'Ended') {
+    room.status = 'Waiting';
+  }
+  apt.teleconsultStatus = room.status;
+  apt.teleconsultRoomId = room.roomId;
+
+  room.seqCounter += 1;
+  const readySignal: TeleconsultSignalItem = {
+    seq: room.seqCounter,
+    senderId: req.user!.userId,
+    senderRole: authCheck.participantRole,
+    type: 'peer-ready',
+    payload: { role: authCheck.participantRole, joinedAt: nowIso },
+    createdAt: nowIso,
+  };
+  room.signals.push(readySignal);
+  if (room.signals.length > 200) room.signals.shift();
+
+  if (authCheck.peerUserId) {
+    emitToSpecificUser(authCheck.peerUserId, 'teleconsult:signal', {
+      appointmentId: apt.id,
+      signal: readySignal,
+      roomStatus: room.status,
+      patientOnline: room.patientOnline,
+      doctorOnline: room.doctorOnline,
+    });
+  }
+
+  flushClinicStateToDisk();
+  const ice = buildIceServersConfig();
+  return res.json({
+    success: true,
+    participantRole: authCheck.participantRole,
+    room: {
+      appointmentId: room.appointmentId,
+      roomId: room.roomId,
+      patientOnline: room.patientOnline,
+      doctorOnline: room.doctorOnline,
+      status: room.status,
+      startedAt: room.startedAt,
+      latestSeq: room.seqCounter,
+    },
+    rtcConfig: { iceServers: ice.iceServers },
+    hasTurnConfigured: ice.hasTurnConfigured,
+  });
+});
+
+app.post('/api/teleconsult/:appointmentId/signal', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const apt = memAppointments.find((a) => a.id === req.params.appointmentId);
+  if (!apt) return res.status(404).json({ error: 'Appointment not found.' });
+
+  const authCheck = getAuthorizedTeleconsultParticipant(req, apt);
+  if (!authCheck.allowed || !authCheck.participantRole) {
+    return res.status(403).json({ error: authCheck.error });
+  }
+
+  const type = req.body?.type as TeleconsultSignalItem['type'];
+  if (!['offer', 'answer', 'ice-candidate', 'peer-ready', 'peer-left', 'media-state'].includes(type)) {
+    return res.status(400).json({ error: 'Unsupported WebRTC signaling message type.' });
+  }
+
+  const room = getOrCreateTeleconsultRoom(apt);
+  room.seqCounter += 1;
+  const item: TeleconsultSignalItem = {
+    seq: room.seqCounter,
+    senderId: req.user!.userId,
+    senderRole: authCheck.participantRole,
+    type,
+    payload: req.body?.payload ?? null,
+    createdAt: new Date().toISOString(),
+  };
+  room.signals.push(item);
+  if (room.signals.length > 250) room.signals.shift();
+
+  if (authCheck.peerUserId) {
+    emitToSpecificUser(authCheck.peerUserId, 'teleconsult:signal', {
+      appointmentId: apt.id,
+      signal: item,
+      roomStatus: room.status,
+    });
+  }
+
+  return res.json({ success: true, seq: item.seq });
+});
+
+app.get('/api/teleconsult/:appointmentId/signals', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const apt = memAppointments.find((a) => a.id === req.params.appointmentId);
+  if (!apt) return res.status(404).json({ error: 'Appointment not found.' });
+
+  const authCheck = getAuthorizedTeleconsultParticipant(req, apt);
+  if (!authCheck.allowed || !authCheck.participantRole) {
+    return res.status(403).json({ error: authCheck.error });
+  }
+
+  const afterSeq = Number(req.query.after || 0);
+  const room = getOrCreateTeleconsultRoom(apt);
+  const peerSignals = room.signals.filter(
+    (s) => s.seq > afterSeq && s.senderRole !== authCheck.participantRole
+  );
+
+  return res.json({
+    success: true,
+    latestSeq: room.seqCounter,
+    roomStatus: room.status,
+    patientOnline: room.patientOnline,
+    doctorOnline: room.doctorOnline,
+    signals: peerSignals,
+  });
+});
+
+app.post('/api/teleconsult/:appointmentId/end', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const apt = memAppointments.find((a) => a.id === req.params.appointmentId);
+  if (!apt) return res.status(404).json({ error: 'Appointment not found.' });
+
+  const authCheck = getAuthorizedTeleconsultParticipant(req, apt);
+  if (!authCheck.allowed || !authCheck.participantRole) {
+    return res.status(403).json({ error: authCheck.error });
+  }
+
+  const nowIso = new Date().toISOString();
+  const room = getOrCreateTeleconsultRoom(apt);
+  if (authCheck.participantRole === 'patient') {
+    room.patientOnline = false;
+  } else {
+    room.doctorOnline = false;
+  }
+
+  const markCompleted = Boolean(req.body?.markCompleted && authCheck.participantRole === 'doctor');
+  if (markCompleted) {
+    room.status = 'Ended';
+    room.endedAt = nowIso;
+    apt.teleconsultStatus = 'Ended';
+    apt.status = 'Completed';
+    apt.completedAt = nowIso;
+  } else if (!room.patientOnline && !room.doctorOnline) {
+    room.status = apt.status === 'Completed' ? 'Ended' : 'Waiting';
+    apt.teleconsultStatus = room.status;
+  }
+
+  room.seqCounter += 1;
+  const leaveSignal: TeleconsultSignalItem = {
+    seq: room.seqCounter,
+    senderId: req.user!.userId,
+    senderRole: authCheck.participantRole,
+    type: 'peer-left',
+    payload: { role: authCheck.participantRole, markCompleted },
+    createdAt: nowIso,
+  };
+  room.signals.push(leaveSignal);
+
+  if (authCheck.peerUserId) {
+    emitToSpecificUser(authCheck.peerUserId, 'teleconsult:signal', {
+      appointmentId: apt.id,
+      signal: leaveSignal,
+      roomStatus: room.status,
+      patientOnline: room.patientOnline,
+      doctorOnline: room.doctorOnline,
+    });
+  }
+
+  flushClinicStateToDisk();
+  return res.json({ success: true, appointment: apt, roomStatus: room.status });
+});
+
+/* ==========================================================================
+   OPERATIONAL SETTINGS, NOTIFICATION PREFERENCES & SCHEDULED REMINDERS
+   ========================================================================== */
+app.get('/api/settings/clinic', requireVerifiedAuth, (_req: AuthenticatedRequest, res: Response) => {
+  return res.json({ success: true, settings: memClinicSettings });
+});
+
+app.patch('/api/settings/clinic', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+  const body = req.body || {};
+  const nowIso = new Date().toISOString();
+
+  if (body.noShowGraceMinutes !== undefined) {
+    memClinicSettings.noShowGraceMinutes = Math.max(5, Math.min(120, Math.round(Number(body.noShowGraceMinutes) || 30)));
+  }
+  if (body.inactivityTimeoutSeconds !== undefined) {
+    memClinicSettings.inactivityTimeoutSeconds = setGlobalInactivityTimeoutSeconds(Number(body.inactivityTimeoutSeconds));
+  }
+  if (body.inactivityWarningSeconds !== undefined) {
+    memClinicSettings.inactivityWarningSeconds = Math.max(15, Math.min(180, Math.round(Number(body.inactivityWarningSeconds) || 60)));
+  }
+  if (body.allowOnlineConsultations !== undefined) {
+    memClinicSettings.allowOnlineConsultations = Boolean(body.allowOnlineConsultations);
+  }
+  if (body.defaultReminder24h !== undefined) {
+    memClinicSettings.defaultReminder24h = Boolean(body.defaultReminder24h);
+  }
+  if (body.defaultReminder2h !== undefined) {
+    memClinicSettings.defaultReminder2h = Boolean(body.defaultReminder2h);
+  }
+
+  memClinicSettings.updatedAt = nowIso;
+  memClinicSettings.updatedBy = req.user?.name || 'Administrator';
+
+  memAuditLogs.unshift({
+    id: `aud-${Date.now()}`,
+    timestamp: nowIso,
+    userId: req.user!.userId,
+    userName: memClinicSettings.updatedBy,
+    userRole: 'admin',
+    action: 'CLINIC_SETTINGS_UPDATED',
+    resourceType: 'System',
+    resourceId: 'clinic-settings',
+    description: `Updated clinic operational settings: No-Show grace=${memClinicSettings.noShowGraceMinutes}m, Inactivity timeout=${memClinicSettings.inactivityTimeoutSeconds}s.`,
+    ipAddress: String(req.ip || '127.0.0.1'),
+  });
+
+  flushClinicStateToDisk();
+  emitToStaffAndAdmin('settings:updated', { settings: memClinicSettings });
+  return res.json({ success: true, settings: memClinicSettings });
+});
+
+app.get('/api/notifications/preferences', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const targetPatientId =
+    req.user!.role === 'patient'
+      ? req.user?.linkedPatientId || req.linkedPatientId || req.user!.userId
+      : String(req.query.patientId || '');
+
+  if (!targetPatientId) {
+    return res.status(400).json({ error: 'patientId is required.' });
+  }
+  const prefs = memNotificationPreferences.get(targetPatientId) || getDefaultNotificationPreferences(targetPatientId);
+  return res.json({ success: true, preferences: prefs });
+});
+
+app.put('/api/notifications/preferences', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId || req.user!.userId;
+  const targetPatientId = actorRole === 'patient' ? linkedId : String(req.body?.patientId || '');
+
+  if (!targetPatientId) {
+    return res.status(400).json({ error: 'patientId is required.' });
+  }
+  if (actorRole !== 'patient' && actorRole !== 'admin' && actorRole !== 'receptionist') {
+    return res.status(403).json({ error: 'Forbidden: Cannot modify notification preferences.' });
+  }
+
+  const existing = memNotificationPreferences.get(targetPatientId) || getDefaultNotificationPreferences(targetPatientId);
+  const updated: NotificationPreferences = {
+    patientId: targetPatientId,
+    emailEnabled: req.body?.emailEnabled !== undefined ? Boolean(req.body.emailEnabled) : existing.emailEnabled,
+    webPushEnabled: req.body?.webPushEnabled !== undefined ? Boolean(req.body.webPushEnabled) : existing.webPushEnabled,
+    smsEnabled: req.body?.smsEnabled !== undefined ? Boolean(req.body.smsEnabled) : existing.smsEnabled,
+    reminder24hEnabled: req.body?.reminder24hEnabled !== undefined ? Boolean(req.body.reminder24hEnabled) : existing.reminder24hEnabled,
+    reminder2hEnabled: req.body?.reminder2hEnabled !== undefined ? Boolean(req.body.reminder2hEnabled) : existing.reminder2hEnabled,
+    consentUpdatedAt: new Date().toISOString(),
+  };
+  memNotificationPreferences.set(targetPatientId, updated);
+  flushClinicStateToDisk();
+  return res.json({ success: true, preferences: updated });
+});
+
+app.get('/api/reminders/logs', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
+  const actorRole = req.user!.role;
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
+  if (actorRole === 'patient') {
+    if (!linkedId) return res.json([]);
+    return res.json(memReminderLogs.filter((l) => l.patientId === linkedId));
+  }
+  if (!['admin', 'receptionist', 'nurse', 'doctor'].includes(actorRole)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  return res.json(memReminderLogs);
+});
+
+async function runScheduledRemindersHandler(req: AuthenticatedRequest, res: Response) {
+  const cronSecret = process.env.CRON_SECRET?.trim();
+  const authHeader = String(req.headers.authorization || '');
+  const bearerSecret = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const hasValidCronSecret = Boolean(cronSecret && bearerSecret === cronSecret);
+  const hasAuthorizedUser = Boolean(
+    req.user && ['admin', 'receptionist', 'nurse', 'doctor'].includes(req.user.role)
+  );
+
+  if (!hasValidCronSecret && !hasAuthorizedUser) {
+    return res.status(401).json({
+      success: false,
+      error: 'Authorized CRON_SECRET bearer header or authenticated staff/admin session required.',
+    });
+  }
+
+  const simulatedNow = req.body?.now ? new Date(String(req.body.now)) : new Date();
+  const effectiveNow = isNaN(simulatedNow.getTime()) ? new Date() : simulatedNow;
+
+  const summary = await evaluateDueAppointmentReminders({
+    appointments: memAppointments,
+    patients: memPatients,
+    preferencesByPatient: memNotificationPreferences,
+    existingLogs: memReminderLogs,
+    createInAppNotification: createAndPersistNotification,
+    defaultReminder24h: memClinicSettings.defaultReminder24h,
+    defaultReminder2h: memClinicSettings.defaultReminder2h,
+    now: effectiveNow,
+  });
+
+  if (summary.logsCreated.length > 0) {
+    flushClinicStateToDisk();
+  }
+
+  return res.json({
+    success: true,
+    evaluatedAt: effectiveNow.toISOString(),
+    ...summary,
+  });
+}
+
+app.get('/api/cron/reminders', runScheduledRemindersHandler);
+app.post('/api/cron/reminders', runScheduledRemindersHandler);
+
+// Background server-side reminder check every 60s when running as a persistent Node server (unref so tests exit cleanly)
+const reminderInterval = setInterval(() => {
+  evaluateDueAppointmentReminders({
+    appointments: memAppointments,
+    patients: memPatients,
+    preferencesByPatient: memNotificationPreferences,
+    existingLogs: memReminderLogs,
+    createInAppNotification: createAndPersistNotification,
+    defaultReminder24h: memClinicSettings.defaultReminder24h,
+    defaultReminder2h: memClinicSettings.defaultReminder2h,
+  })
+    .then((res) => {
+      if (res.logsCreated.length > 0) flushClinicStateToDisk();
+    })
+    .catch(() => {});
+}, 60 * 1000);
+if (typeof reminderInterval.unref === 'function') {
+  reminderInterval.unref();
+}
+
+/* ==========================================================================
+   AUDIT LOGS & COMPLIANCE (Protected: Verified Admin Only)
+   ========================================================================== */
+app.get('/api/audit-logs', requireAdmin, (_req: AuthenticatedRequest, res: Response) => {
   return res.json(memAuditLogs);
 });
 
-app.post('/api/audit-logs', (req: AuthenticatedRequest, res: Response) => {
+app.post('/api/audit-logs', requireVerifiedAuth, (req: AuthenticatedRequest, res: Response) => {
   const log = req.body;
   if (!log || typeof log !== 'object') return res.status(400).json({ error: 'Invalid log payload' });
   const newLog = {
     ...log,
     id: log.id || `aud-${Date.now()}`,
-    timestamp: log.timestamp || new Date().toISOString(),
-    ipAddress: log.ipAddress || req.ip || '127.0.0.1',
+    userId: req.user!.userId,
+    userName: req.user!.name || log.userName || 'Authenticated User',
+    userRole: req.user!.role,
+    timestamp: new Date().toISOString(),
+    ipAddress: String(req.ip || '127.0.0.1'),
   };
   memAuditLogs.unshift(newLog);
   if (memAuditLogs.length > 500) memAuditLogs.pop();
@@ -3433,75 +5483,80 @@ app.post('/api/audit-logs', (req: AuthenticatedRequest, res: Response) => {
 });
 
 /* ==========================================================================
-   FULL CLINIC STATE SYNCHRONIZATION (High-speed initial & continuous sync)
+   FULL CLINIC STATE SYNCHRONIZATION (Authenticated Role-Scoped Sync)
    ========================================================================== */
-app.get('/api/clinic/sync', async (req: AuthenticatedRequest, res: Response) => {
+app.get('/api/clinic/sync', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
   if (supabaseServer && memAppointments.length === 0) {
     try {
       await hydrateClinicStateFromSupabase();
     } catch {}
   }
 
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+  const verifiedRole = req.user!.role;
+  const isPatient = verifiedRole === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
 
-  let patientsData = memPatients;
-  let appointmentsData = memAppointments;
-  let consultationsData = memConsultations;
-  let prescriptionsData = memPrescriptions;
-  let labOrdersData = memLabOrders;
-  let invoicesData = memInvoices;
-  let auditLogsData = isPatient ? [] : memAuditLogs;
+  let patientsData = ['admin', 'doctor', 'nurse', 'receptionist'].includes(verifiedRole) ? memPatients : [];
+  let appointmentsData = ['admin', 'doctor', 'nurse', 'receptionist'].includes(verifiedRole) ? memAppointments : [];
+  let consultationsData = ['admin', 'doctor', 'nurse'].includes(verifiedRole) ? memConsultations : [];
+  let prescriptionsData = ['admin', 'doctor', 'pharmacist', 'nurse'].includes(verifiedRole) ? memPrescriptions : [];
+  let labOrdersData = ['admin', 'doctor', 'nurse', 'lab_technician'].includes(verifiedRole) ? memLabOrders : [];
+  let invoicesData = ['admin', 'receptionist'].includes(verifiedRole) ? memInvoices : [];
+  const inventoryData = ['admin', 'pharmacist', 'doctor', 'nurse'].includes(verifiedRole) ? memInventory : [];
+  const inventoryTransactionsData = ['admin', 'pharmacist'].includes(verifiedRole) ? memInventoryTransactions : [];
+  const restockRequestsData = ['admin', 'pharmacist'].includes(verifiedRole) ? memRestockRequests : [];
+  const auditLogsData = verifiedRole === 'admin' ? memAuditLogs : [];
 
-  if (isPatient && linkedId) {
-    const patient = memPatients.find((p) => p.id === linkedId);
-    patientsData = memPatients.filter((p) => p.id === linkedId);
-    
-    // Patient's own full appointments with complete medical context
-    const ownAppointments = memAppointments.filter(
-      (a) => a.patientId === linkedId || (patient && a.patientName === patient.fullName)
-    );
+  if (isPatient) {
+    if (!linkedId) {
+      patientsData = [];
+      appointmentsData = [];
+      consultationsData = [];
+      prescriptionsData = [];
+      labOrdersData = [];
+      invoicesData = [];
+    } else {
+      patientsData = memPatients.filter((p) => p.id === linkedId);
 
-    // Sanitized slot reservations for other patients (NO personal medical details, names, or MRNs)
-    // strictly to allow live, accurate doctor slot availability and prevent double bookings
-    const otherBookedSlots = memAppointments
-      .filter((a) => a.status !== 'Cancelled' && a.patientId !== linkedId && (!patient || a.patientName !== patient.fullName))
-      .map((a) => ({
-        id: a.id,
-        doctorId: a.doctorId,
-        doctorName: a.doctorName,
-        department: a.department,
-        date: a.date,
-        time: a.time,
-        durationMinutes: a.durationMinutes || 30,
-        status: a.status,
-        type: 'Consultation' as const,
-        patientId: 'REDACTED',
-        patientName: 'Occupied Slot',
-        patientMrn: 'REDACTED',
-        reason: 'Reserved Time Slot',
-        createdAt: a.createdAt,
-      }));
+      // Strictly bound to linkedId — NEVER match by display name or email alone
+      const ownAppointments = memAppointments.filter((a) => a.patientId === linkedId);
 
-    appointmentsData = [...ownAppointments, ...otherBookedSlots];
-    consultationsData = memConsultations.filter(
-      (c) => c.patientId === linkedId || (patient && c.patientName === patient.fullName)
-    );
-    prescriptionsData = memPrescriptions.filter(
-      (rx) => rx.patientId === linkedId || (patient && rx.patientName === patient.fullName)
-    );
-    labOrdersData = memLabOrders.filter(
-      (o) => o.patientId === linkedId || (patient && o.patientName === patient.fullName)
-    );
-    invoicesData = memInvoices.filter(
-      (i) => i.patientId === linkedId || (patient && i.patientName === patient.fullName)
-    );
+      // Sanitized slot reservations for other patients (NO personal medical details, names, or MRNs)
+      const otherBookedSlots = memAppointments
+        .filter((a) => a.status !== 'Cancelled' && a.status !== 'No Show' && a.patientId !== linkedId)
+        .map((a) => ({
+          id: a.id,
+          doctorId: a.doctorId,
+          doctorName: a.doctorName,
+          department: a.department,
+          branch: a.branch,
+          date: a.date,
+          time: a.time,
+          durationMinutes: a.durationMinutes || 30,
+          status: a.status,
+          type: 'Consultation' as const,
+          consultationMode: a.consultationMode,
+          patientId: 'REDACTED',
+          patientName: 'Occupied Slot',
+          patientMrn: 'REDACTED',
+          reason: 'Reserved Time Slot',
+          createdAt: a.createdAt,
+        }));
+
+      appointmentsData = [...ownAppointments, ...otherBookedSlots];
+      consultationsData = memConsultations.filter((c) => c.patientId === linkedId);
+      prescriptionsData = memPrescriptions.filter((rx) => rx.patientId === linkedId);
+      labOrdersData = memLabOrders
+        .filter((o) => o.patientId === linkedId)
+        .map(redactLabOrderForPatient);
+      invoicesData = memInvoices.filter((i) => i.patientId === linkedId);
+    }
   }
 
-  // Strict user-scoped notification filtering for sync endpoint
-  const currentUserId = req.userId || req.user?.userId || (req.headers['x-user-id'] as string) || (req.query.userId as string);
-  const currentUserEmail = (req.user?.email || (req.headers['x-user-email'] as string) || (req.query.email as string) || '').toLowerCase();
-  const rawRole = (req.userRole || req.user?.role || (req.headers['x-user-role'] as string) || (req.query.role as string) || 'patient').toLowerCase();
+  // Strict user-scoped notification filtering bound to verified token claims
+  const currentUserId = req.user!.userId;
+  const currentUserEmail = (req.user!.email || '').toLowerCase();
+  const rawRole = verifiedRole.toLowerCase();
 
   const notificationsData = memNotifications.filter((n: any) => {
     const notifRecipientId = n.recipientId || n.userId;
@@ -3510,28 +5565,23 @@ app.get('/api/clinic/sync', async (req: AuthenticatedRequest, res: Response) => 
     const notifRecipientEmail = (n.recipientEmail || n.email || '').toLowerCase();
     const notifRole = (n.recipientRole || n.targetRole || '').toLowerCase();
 
-    // 1. PATIENT ISOLATION:
     if (rawRole === 'patient') {
       const matchesPatientId = Boolean(linkedId && (notifRecipientId === linkedId || notifPatientId === linkedId));
       const matchesUserId = Boolean(currentUserId && notifRecipientId === currentUserId);
-      const matchesEmail = Boolean(currentUserEmail && notifRecipientEmail && notifRecipientEmail === currentUserEmail);
-      if (!matchesPatientId && !matchesUserId && !matchesEmail) return false;
+      if (!matchesPatientId && !matchesUserId) return false;
       return notifRole === 'patient' || notifRole === 'all' || matchesPatientId || matchesUserId;
     }
 
-    // 2. DOCTOR ISOLATION:
     if (rawRole === 'doctor') {
       const matchesDocId = Boolean(currentUserId && (notifDoctorId === currentUserId || notifRecipientId === currentUserId));
       const matchesDocEmail = Boolean(currentUserEmail && notifRecipientEmail && notifRecipientEmail === currentUserEmail);
       return matchesDocId || matchesDocEmail;
     }
 
-    // 3. ADMIN ISOLATION:
     if (rawRole === 'admin') {
       return notifRole === 'admin' || n.category === 'inventory' || n.category === 'security' || n.category === 'system';
     }
 
-    // 4. SPECIFIC STAFF:
     if (rawRole === 'nurse') return notifRole === 'nurse' || (notifRole === 'provider' && (n.category === 'triage' || n.category === 'appointment'));
     if (rawRole === 'receptionist') return notifRole === 'receptionist' || (notifRole === 'provider' && n.category === 'appointment');
     if (rawRole === 'pharmacist') return notifRole === 'pharmacist' || n.category === 'prescription' || n.category === 'inventory';
@@ -3539,6 +5589,11 @@ app.get('/api/clinic/sync', async (req: AuthenticatedRequest, res: Response) => 
 
     return false;
   });
+
+  const patientPreferences =
+    isPatient && linkedId
+      ? memNotificationPreferences.get(linkedId) || getDefaultNotificationPreferences(linkedId)
+      : undefined;
 
   return res.json({
     status: 'synced',
@@ -3548,12 +5603,26 @@ app.get('/api/clinic/sync', async (req: AuthenticatedRequest, res: Response) => 
     consultations: consultationsData,
     prescriptions: prescriptionsData,
     labOrders: labOrdersData,
-    inventory: memInventory,
+    inventory: inventoryData,
+    inventoryTransactions: inventoryTransactionsData,
+    restockRequests: restockRequestsData,
     invoices: invoicesData,
     auditLogs: auditLogsData,
     notifications: notificationsData,
+    clinicSettings: memClinicSettings,
+    notificationPreferences: patientPreferences,
+    reminderLogs: isPatient && linkedId
+      ? memReminderLogs.filter((l) => l.patientId === linkedId)
+      : ['admin', 'receptionist', 'nurse', 'doctor'].includes(verifiedRole)
+      ? memReminderLogs
+      : [],
     doctors: memUsers.filter((u) => u.role === 'doctor'),
-    users: isPatient ? [] : memUsers,
+    users:
+      verifiedRole === 'admin'
+        ? memUsers
+        : isPatient
+        ? []
+        : memUsers.filter((u) => u.role !== 'patient'),
   });
 });
 
@@ -3623,11 +5692,11 @@ export async function createAndPersistNotification(notif: Partial<Notification> 
   return fullNotif;
 }
 
-app.get('/api/notifications', async (req: AuthenticatedRequest, res: Response) => {
-  const currentUserId = req.userId || req.user?.userId || (req.headers['x-user-id'] as string) || (req.query.userId as string);
-  const currentUserEmail = (req.user?.email || (req.headers['x-user-email'] as string) || (req.query.email as string) || '').toLowerCase();
-  const rawRole = (req.userRole || req.user?.role || (req.headers['x-user-role'] as string) || (req.query.role as string) || 'patient').toLowerCase();
-  const linkedPatientId = req.linkedPatientId || req.user?.linkedPatientId || (req.headers['x-linked-patient-id'] as string) || (req.query.patientId as string);
+app.get('/api/notifications', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const currentUserId = req.user!.userId;
+  const currentUserEmail = (req.user!.email || '').toLowerCase();
+  const rawRole = req.user!.role.toLowerCase();
+  const linkedPatientId = req.user?.linkedPatientId || req.linkedPatientId;
 
   try {
     // 1. Fetch live notifications from Supabase audit_logs where action = 'NOTIFICATION'
@@ -3749,10 +5818,15 @@ app.get('/api/notifications', async (req: AuthenticatedRequest, res: Response) =
   }
 });
 
-app.patch('/api/notifications/:id/read', async (req: AuthenticatedRequest, res: Response) => {
+app.patch('/api/notifications/:id/read', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const notif = memNotifications.find((n) => n.id === id);
   if (notif) {
+    const isPatient = req.user!.role === 'patient';
+    const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
+    if (isPatient && linkedId && notif.patientId && notif.patientId !== linkedId && notif.recipientId !== linkedId) {
+      return res.status(403).json({ error: 'Forbidden: Cannot modify notifications belonging to another patient.' });
+    }
     notif.read = true;
   }
 
@@ -3771,10 +5845,10 @@ app.patch('/api/notifications/:id/read', async (req: AuthenticatedRequest, res: 
   return res.json({ success: true, notification: notif || { id, read: true } });
 });
 
-app.post('/api/notifications/read-all', async (req: AuthenticatedRequest, res: Response) => {
-  const currentUserId = req.userId || req.user?.userId;
-  const rawRole = (req.userRole || req.user?.role || 'patient').toLowerCase();
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+app.post('/api/notifications/read-all', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const currentUserId = req.user!.userId;
+  const rawRole = req.user!.role.toLowerCase();
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
 
   memNotifications.forEach((n: any) => {
     const notifRecipientId = n.recipientId || n.userId;
@@ -3792,14 +5866,22 @@ app.post('/api/notifications/read-all', async (req: AuthenticatedRequest, res: R
   return res.json({ success: true, message: 'All authorized user notifications marked as read' });
 });
 
-app.post('/api/notifications', async (req: AuthenticatedRequest, res: Response) => {
+app.post('/api/notifications', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
   const body = req.body || {};
+  const isPatient = req.user!.role === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId || req.user!.userId;
+
+  // Prevent patients from broadcasting notifications to other patients or admin-wide channels
+  if (isPatient && body.patientId && body.patientId !== linkedId) {
+    return res.status(403).json({ error: 'Forbidden: Patients cannot send notifications to other patients.' });
+  }
+
   const newNotif = await createAndPersistNotification({
     id: body.id,
-    recipientId: body.recipientId || body.userId,
+    recipientId: isPatient && (!body.targetRole || body.targetRole === 'patient') ? linkedId : (body.recipientId || body.userId),
     recipientRole: body.recipientRole || body.targetRole || 'patient',
     targetRole: body.targetRole || 'all',
-    patientId: body.patientId,
+    patientId: isPatient ? linkedId : body.patientId,
     doctorId: body.doctorId,
     title: body.title || 'New Clinic Update',
     message: body.message || '',
@@ -3853,14 +5935,7 @@ const EMERGENCY_HARDCODED_DISCLAIMER =
   'SmartClinic AI is a triage assistant and NOT a medical doctor. We CANNOT diagnose conditions or prescribe medications. ' +
   'Please do NOT wait for an online reply or standard appointment. Call 911 immediately or go to the nearest Emergency Room / urgent care facility right away.';
 
-app.post('/api/ai/clinical-notes', async (req: AuthenticatedRequest, res: Response) => {
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  if (isPatient) {
-    return res.status(403).json({
-      error: 'Access Denied: The Clinical Decision Support Scribe is restricted to licensed clinical staff.',
-    });
-  }
-
+app.post('/api/ai/clinical-notes', requireVerifiedRoles('admin', 'doctor', 'nurse'), async (req: AuthenticatedRequest, res: Response) => {
   const { patientInfo, rawNotes, vitals, chiefComplaint } = req.body || {};
   try {
     if (ai) {
@@ -3924,20 +5999,20 @@ Respond ONLY with valid JSON having the following schema:
   });
 });
 
-app.post('/api/ai/patient-summary', async (req: AuthenticatedRequest, res: Response) => {
+app.post('/api/ai/patient-summary', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { patient } = req.body || {};
-  const isPatient = (req.userRole || req.user?.role) === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+  const isPatient = req.user?.role === 'patient';
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
 
   // Enforce patient isolation
-  if (isPatient && linkedId && patient?.id && patient.id !== linkedId) {
+  if (isPatient && (!linkedId || (patient?.id && patient.id !== linkedId))) {
     return res.status(403).json({ error: 'Data isolation violation: You may only summarize your own records.' });
   }
 
   return res.json({
     success: true,
     data: {
-      executiveSummary: `${patient?.fullName || 'Patient'} profile synthesized for clinical review under Philippine Health Data Security Standards (RA 10173).`,
+      executiveSummary: `${patient?.fullName || 'Patient'} profile synthesized for clinical review with role-based privacy controls.`,
       keyConditions: patient?.chronicConditions || ['General Outpatient Care'],
       activeMedicationRegimen: patient?.currentMedications || [],
       allergyAlerts: (patient?.allergies || []).map((a: any) => `${a.allergen} (${a.severity})`),
@@ -3948,8 +6023,8 @@ app.post('/api/ai/patient-summary', async (req: AuthenticatedRequest, res: Respo
   });
 });
 
-app.post('/api/ai/lab-interpretation', async (req: AuthenticatedRequest, res: Response) => {
-  const { testName, results, patientContext } = req.body || {};
+app.post('/api/ai/lab-interpretation', requireVerifiedRoles('admin', 'doctor', 'nurse', 'lab_technician'), async (req: AuthenticatedRequest, res: Response) => {
+  const { testName, results } = req.body || {};
   return res.json({
     success: true,
     data: {
@@ -3961,8 +6036,8 @@ app.post('/api/ai/lab-interpretation', async (req: AuthenticatedRequest, res: Re
   });
 });
 
-app.post('/api/ai/medication-safety', async (req: AuthenticatedRequest, res: Response) => {
-  const { proposedItems, currentMedications, allergies } = req.body || {};
+app.post('/api/ai/medication-safety', requireVerifiedRoles('admin', 'doctor', 'nurse', 'pharmacist'), async (req: AuthenticatedRequest, res: Response) => {
+  const { allergies } = req.body || {};
   return res.json({
     success: true,
     data: {
@@ -3976,32 +6051,39 @@ app.post('/api/ai/medication-safety', async (req: AuthenticatedRequest, res: Res
   });
 });
 
-app.post('/api/ai/chat', async (req: AuthenticatedRequest, res: Response) => {
-  const { message, conversationHistory, context, role, page, patientId } = req.body || {};
+app.post('/api/ai/chat', requireVerifiedAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { message, context, page, patientId, conversationHistory } = req.body || {};
   const userText = String(message || '').trim();
 
-  // Resolve active specialized role
-  const rawRole = (role || req.userRole || req.user?.role || 'patient').toLowerCase();
+  // Derive active role strictly from verified token claims (never trust req.body.role)
+  const rawRole = req.user!.role.toLowerCase();
   let activeRole: 'patient' | 'doctor' | 'nurse' | 'receptionist' | 'pharmacist' | 'lab_technician' | 'admin' = 'patient';
-  if (['admin', 'manager', 'executive'].includes(rawRole)) activeRole = 'admin';
-  else if (['doctor', 'physician'].includes(rawRole)) activeRole = 'doctor';
-  else if (['nurse'].includes(rawRole)) activeRole = 'nurse';
-  else if (['receptionist', 'frontdesk', 'clerk'].includes(rawRole)) activeRole = 'receptionist';
-  else if (['pharmacist', 'pharmacy'].includes(rawRole)) activeRole = 'pharmacist';
-  else if (['lab_technician', 'lab', 'technician'].includes(rawRole)) activeRole = 'lab_technician';
+  if (rawRole === 'admin') activeRole = 'admin';
+  else if (rawRole === 'doctor') activeRole = 'doctor';
+  else if (rawRole === 'nurse') activeRole = 'nurse';
+  else if (rawRole === 'receptionist') activeRole = 'receptionist';
+  else if (rawRole === 'pharmacist') activeRole = 'pharmacist';
+  else if (rawRole === 'lab_technician') activeRole = 'lab_technician';
   else activeRole = 'patient';
 
   let activePage = String(page || context?.activePage || 'Dashboard').trim();
   const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
   const isEmergency = detectEmergencySymptoms(userText);
 
-  // Identify targeted patient for clinical context (do not fallback to hardcoded demo patient)
-  const targetPatId = patientId || context?.patientId || linkedId;
-  const userEmail = req.user?.email?.toLowerCase();
+  if (activeRole === 'patient') {
+    const requestedPatId = patientId || context?.patientId;
+    if (requestedPatId && linkedId && requestedPatId !== linkedId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden: Patients can only query their own clinical context.',
+      });
+    }
+  }
+
+  // Identify targeted patient for clinical context (strictly bound to linkedId for patients; no email fallback)
+  const targetPatId = activeRole === 'patient' ? linkedId : (patientId || context?.patientId || linkedId);
   const targetPatient = targetPatId
-    ? memPatients.find((p) => p.id === targetPatId)
-    : userEmail
-    ? memPatients.find((p) => p.email && p.email.toLowerCase() === userEmail)
+    ? memPatients.find((p) => p.id === targetPatId) || null
     : null;
 
   const now = new Date();
@@ -4225,10 +6307,10 @@ ROLE CAPABILITIES:
         unpaidClaimsTotal: unpaidClaims.reduce((acc, curr) => acc + (curr.totalAmount - (curr.paidAmount || 0)), 0),
       },
       complianceAndSystem: {
-        dataPrivacyStandard: 'RA 10173 Compliant (Philippine Health Data Security)',
+        accessControlPolicy: 'Role-Based Access Control (RBAC) & Row-Level Security (Synthetic Capstone Prototype)',
         auditLogEntriesToday: memAuditLogs.length,
         systemHealth: '100% Operational, Real-Time Sync Active',
-        databaseEngine: 'Supabase PostgreSQL (17 Core Normalized Modules)',
+        databaseEngine: 'Supabase PostgreSQL (Normalized Schema with RLS)',
       },
     };
 
@@ -4237,8 +6319,8 @@ ROLE CAPABILITIES:
 1. Deliver comprehensive clinic operational overviews, KPIs, and department throughput based on live database state.
 2. Monitor user management, staff roster coverage, and clinic exam room utilization.
 3. Report on appointment volumes, pharmacy inventory reorder alerts, and billing claims status.
-4. Provide security and compliance monitoring under Philippine Health Data Security Standards (RA 10173).
-SECURITY DIRECTIVE: Strictly withhold private patient clinical consultation notes; focus exclusively on operational, administrative, and compliance metrics.`;
+4. Provide operational security and access-control audit monitoring (RBAC, audit logs, and synthetic prototype safeguards).
+SECURITY DIRECTIVE: Strictly withhold private patient clinical consultation notes; focus exclusively on operational, administrative, and security metrics.`;
 
   } else if (activeRole === 'lab_technician') {
     const pendingOrders = memLabOrders.filter((l) => l.status === 'Requested' || l.status === 'Processing');
@@ -4519,8 +6601,8 @@ Respond strictly according to your role instructions. If in clinical triage mode
       `• Billed Invoices Revenue: $${memInvoices.reduce((a, c) => a + (c.totalAmount || 0), 0).toLocaleString()}\n\n` +
       `📦 Pharmacy Inventory Health:\n` +
       `• Low Stock Reorder Alerts: ${lowStock.length} items (${lowStock.map((l) => l.name).slice(0, 3).join(', ') || 'All stocks normal'})\n\n` +
-      `🛡️ Compliance & Security Audit:\n` +
-      `• RA 10173 Health Data Privacy: Verified Compliant (Strict Role & Tenant Isolation Active)\n` +
+      `🛡️ Access Control & Security Audit:\n` +
+      `• Role-Based Access Control & Tenant Isolation: Active\n` +
       `• Audit Trail: ${memAuditLogs.length} logged access events recorded in tamper-evident ledger.`;
   } else if (activeRole === 'lab_technician') {
     const pending = memLabOrders.filter((l) => l.status === 'Requested' || l.status === 'Processing');
@@ -4618,7 +6700,7 @@ Respond strictly according to your role instructions. If in clinical triage mode
   });
 });
 
-app.post('/api/ai/predictive-risk', async (req: Request, res: Response) => {
+app.post('/api/ai/predictive-risk', requireVerifiedRoles('admin', 'doctor', 'nurse'), async (req: AuthenticatedRequest, res: Response) => {
   const { patient, vitals, riskProfile } = req.body || {};
   const patientName = patient?.fullName || 'Patient';
   const age = patient?.age || 50;

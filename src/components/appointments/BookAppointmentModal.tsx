@@ -1,18 +1,30 @@
 import React, { useState, useMemo, useEffect } from 'react';
+import QRCode from 'qrcode';
 import { useClinic } from '../../context/ClinicContext';
+import { usePrint } from '../../context/PrintContext';
 import {
   X,
   Calendar as CalendarIcon,
   Clock,
   ChevronLeft,
   ChevronRight,
-  User,
   CheckCircle2,
   AlertCircle,
   CalendarCheck,
-  ShieldCheck,
+  MapPin,
+  Stethoscope,
+  Video,
+  Building2,
+  Printer,
+  QrCode,
+  Info,
 } from 'lucide-react';
-import type { User as ClinicUser, Appointment } from '../../types/clinic';
+import type {
+  User as ClinicUser,
+  Appointment,
+  ConsultationMode,
+  ClinicBranch,
+} from '../../types/clinic';
 import {
   getDoctorSchedule,
   isDoctorWorkingOnDate,
@@ -21,14 +33,25 @@ import {
   normalizeTimeTo24Hour,
 } from '../../utils/doctorSchedules';
 import { getManilaDateString } from '../../utils/manilaTime';
-import { canPatientRebookOnDate, validateAppointmentSlotBooking } from '../../utils/schedulingRules';
+import {
+  canPatientRebookOnDate,
+  validateAppointmentSlotBooking,
+  validatePatientBookingDateManila,
+  NO_SAME_DAY_BOOKING_MESSAGE,
+} from '../../utils/schedulingRules';
+import {
+  CLINIC_BRANCHES,
+  matchSpecialtiesForReason,
+  isDoctorOfferedAtBranch,
+  NON_DIAGNOSTIC_MATCHER_DISCLAIMER,
+} from '../../utils/specialtyMatcher';
 
 interface Props {
   initialPatientId?: string;
   onClose: () => void;
 }
 
-const SAFE_BOOKING_DRAFT_KEY = 'smart_clinic_safe_draft_booking';
+const SAFE_BOOKING_DRAFT_KEY = 'smart_clinic_v2_safe_draft_booking';
 
 export const BookAppointmentModal: React.FC<Props> = ({ initialPatientId, onClose }) => {
   const {
@@ -36,64 +59,31 @@ export const BookAppointmentModal: React.FC<Props> = ({ initialPatientId, onClos
     users,
     appointments,
     allClinicAppointments,
-    addAppointment,
+    createAppointmentVerified,
     activeRole,
     primaryRole,
     linkedPatientId,
     visiblePatients,
-    addNotification,
     setActiveTab,
     triageDraftForBooking,
     setTriageDraftForBooking,
-    logAction,
+    setActiveClinicalSessionProtected,
   } = useClinic();
+  const { printAppointmentConfirmation, printAppointmentQr } = usePrint();
 
-  const isPatientLocked = primaryRole === 'patient' && !!linkedPatientId;
+  useEffect(() => {
+    setActiveClinicalSessionProtected(true);
+    return () => setActiveClinicalSessionProtected(false);
+  }, [setActiveClinicalSessionProtected]);
+
+  const isPatientLocked =
+    (primaryRole === 'patient' || activeRole === 'patient') && Boolean(linkedPatientId);
   const patientOptions = isPatientLocked ? visiblePatients : patients;
 
-  // Filter clinical doctors
-  const doctors: ClinicUser[] = useMemo(() => {
-    return users.filter((u) => u.role === 'doctor');
-  }, [users]);
-
-  // Match doctor based on triage specialty if available
-  const matchingDoctor = useMemo(() => {
-    if (!triageDraftForBooking) return null;
-    if (triageDraftForBooking.recommendedDoctorId) {
-      const match = doctors.find((d) => d.id === triageDraftForBooking.recommendedDoctorId);
-      if (match) return match;
-    }
-    const spec = (triageDraftForBooking.specialty || triageDraftForBooking.department || '').toLowerCase();
-    if (!spec) return null;
-    return (
-      doctors.find(
-        (d) =>
-          (d.department && d.department.toLowerCase().includes(spec)) ||
-          (d.specialty && d.specialty.toLowerCase().includes(spec)) ||
-          (spec.includes('cardio') && d.department?.toLowerCase().includes('cardio')) ||
-          (spec.includes('pulmon') && d.department?.toLowerCase().includes('pulmon')) ||
-          (spec.includes('respiratory') && d.department?.toLowerCase().includes('pulmon')) ||
-          (spec.includes('derm') && d.department?.toLowerCase().includes('derm')) ||
-          (spec.includes('pediat') && d.department?.toLowerCase().includes('pediat')) ||
-          (spec.includes('child') && d.department?.toLowerCase().includes('pediat')) ||
-          (spec.includes('internal') && d.department?.toLowerCase().includes('internal')) ||
-          (spec.includes('general') && d.department?.toLowerCase().includes('internal'))
-      ) || doctors[0] || null
-    );
-  }, [triageDraftForBooking, doctors]);
-
-  // Extract unique specialties from doctors
-  const specialties = useMemo(() => {
-    const set = new Set<string>();
-    doctors.forEach((d) => {
-      if (d.department) set.add(d.department);
-      if (d.specialty) set.add(d.specialty);
-    });
-    return Array.from(set);
-  }, [doctors]);
-
-  // Steps state: 1. Doctor -> 2. Date -> 3. Time -> 4. Review & Confirm -> 5. Success
-  const [currentStep, setCurrentStep] = useState<1 | 2 | 3 | 4 | 5>(1);
+  const doctors: ClinicUser[] = useMemo(
+    () => users.filter((u) => u.role === 'doctor' && u.status !== 'Inactive'),
+    [users]
+  );
 
   const savedSafeDraft = useMemo(() => {
     try {
@@ -104,150 +94,256 @@ export const BookAppointmentModal: React.FC<Props> = ({ initialPatientId, onClos
     }
   }, []);
 
-  // Form selections (restores non-sensitive draft if session previously timed out)
+  const todayManila = useMemo(() => getManilaDateString(), []);
+  const tomorrowManila = useMemo(() => {
+    const [y, m, d] = todayManila.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d + 1));
+    return dt.toISOString().split('T')[0];
+  }, [todayManila]);
+
+  // Wizard Steps covering all 16 functional steps:
+  // Step 1: Branch -> Reason -> Non-diagnostic Specialty Suggestions -> Select Specialty -> Select Available Doctor
+  // Step 2: Doctor Schedule Calendar (No Same-Day Booking in Asia/Manila) -> Available Time Slot -> Consultation Mode (In-Person / Online)
+  // Step 3: Review All Details & Confirm
+  // Step 4: Immediate Auto-Confirmed Booking Reference + Non-PHI QR / Online Access + Print
+  const [currentStep, setCurrentStep] = useState<1 | 2 | 3 | 4>(1);
+
+  const [selectedBranch, setSelectedBranch] = useState<ClinicBranch>(
+    savedSafeDraft?.selectedBranch === 'Annex Satellite Clinic'
+      ? 'Annex Satellite Clinic'
+      : CLINIC_BRANCHES[0]
+  );
+  const [reason, setReason] = useState<string>(
+    triageDraftForBooking?.reason || savedSafeDraft?.reason || ''
+  );
+
+  // Non-diagnostic specialty suggestions based on free-text reason and selected branch
+  const specialtyMatchResult = useMemo(
+    () =>
+      matchSpecialtiesForReason({
+        reason,
+        branch: selectedBranch,
+        doctors,
+      }),
+    [reason, selectedBranch, doctors]
+  );
+
+  // All specialties available at the selected branch
+  const branchSpecialties = useMemo(() => {
+    const set = new Set<string>();
+    doctors
+      .filter((d) => isDoctorOfferedAtBranch(d, selectedBranch))
+      .forEach((d) => {
+        if (d.specialty) set.add(d.specialty);
+        else if (d.department) set.add(d.department);
+      });
+    return Array.from(set);
+  }, [doctors, selectedBranch]);
+
   const [selectedSpecialty, setSelectedSpecialty] = useState<string>(() => {
+    if (triageDraftForBooking?.specialty) return triageDraftForBooking.specialty;
     if (savedSafeDraft?.selectedSpecialty) return savedSafeDraft.selectedSpecialty;
-    return 'all';
+    return '';
   });
+
+  // Auto-select top suggested specialty when typing reason if user hasn't manually picked a specialty incompatible with branch
+  useEffect(() => {
+    if (!selectedSpecialty && specialtyMatchResult.suggestions.length > 0) {
+      const topAvailable = specialtyMatchResult.suggestions.find((s) =>
+        branchSpecialties.some(
+          (bs) =>
+            bs.toLowerCase().includes(s.specialty.toLowerCase()) ||
+            s.specialty.toLowerCase().includes(bs.toLowerCase())
+        )
+      );
+      if (topAvailable) {
+        const matchedBranchSpec =
+          branchSpecialties.find(
+            (bs) =>
+              bs.toLowerCase().includes(topAvailable.specialty.toLowerCase()) ||
+              topAvailable.specialty.toLowerCase().includes(bs.toLowerCase())
+          ) || '';
+        if (matchedBranchSpec) setSelectedSpecialty(matchedBranchSpec);
+      }
+    }
+  }, [specialtyMatchResult, branchSpecialties, selectedSpecialty]);
+
+  // Actual available doctors at selected branch + specialty
+  const availableBranchDoctors = useMemo(() => {
+    return doctors.filter((doc) => {
+      if (!isDoctorOfferedAtBranch(doc, selectedBranch)) return false;
+      if (!selectedSpecialty || selectedSpecialty === 'ALL') return true;
+      const specLower = selectedSpecialty.toLowerCase();
+      return (
+        (doc.specialty && doc.specialty.toLowerCase().includes(specLower)) ||
+        (doc.department && doc.department.toLowerCase().includes(specLower)) ||
+        specLower.includes((doc.department || '').toLowerCase())
+      );
+    });
+  }, [doctors, selectedBranch, selectedSpecialty]);
 
   const [selectedDoctorId, setSelectedDoctorId] = useState<string>(() => {
-    if (savedSafeDraft?.selectedDoctorId && doctors.some((d) => d.id === savedSafeDraft.selectedDoctorId)) {
-      return savedSafeDraft.selectedDoctorId;
+    if (triageDraftForBooking?.recommendedDoctorId) {
+      return triageDraftForBooking.recommendedDoctorId;
     }
-    if (matchingDoctor) return matchingDoctor.id;
-    return doctors[0]?.id || 'usr-1';
+    if (savedSafeDraft?.selectedDoctorId) return savedSafeDraft.selectedDoctorId;
+    return '';
   });
+
+  useEffect(() => {
+    if (
+      availableBranchDoctors.length > 0 &&
+      !availableBranchDoctors.some((d) => d.id === selectedDoctorId)
+    ) {
+      setSelectedDoctorId(availableBranchDoctors[0].id);
+    } else if (availableBranchDoctors.length === 0) {
+      setSelectedDoctorId('');
+    }
+  }, [availableBranchDoctors, selectedDoctorId]);
+
+  const selectedDoctor = useMemo(
+    () => availableBranchDoctors.find((d) => d.id === selectedDoctorId) || null,
+    [availableBranchDoctors, selectedDoctorId]
+  );
+
+  const selectedDoctorSchedule = useMemo(
+    () => (selectedDoctor ? getDoctorSchedule(selectedDoctor.id, selectedDoctor) : null),
+    [selectedDoctor]
+  );
+
+  const doctorOfferedModes: ConsultationMode[] = useMemo(() => {
+    if (!selectedDoctor) return ['In-Person'];
+    return selectedDoctor.consultationModes && selectedDoctor.consultationModes.length > 0
+      ? selectedDoctor.consultationModes
+      : ['In-Person'];
+  }, [selectedDoctor]);
+
+  const [consultationMode, setConsultationMode] = useState<ConsultationMode>('In-Person');
+
+  useEffect(() => {
+    if (!doctorOfferedModes.includes(consultationMode)) {
+      setConsultationMode(doctorOfferedModes[0]);
+    }
+  }, [doctorOfferedModes, consultationMode]);
 
   const [selectedDate, setSelectedDate] = useState<string>(() => {
-    if (triageDraftForBooking?.preferredDate) return triageDraftForBooking.preferredDate;
-    if (triageDraftForBooking?.globalTomorrowBooking) {
-      const d = new Date();
-      d.setDate(d.getDate() + 1);
-      return getManilaDateString(d);
-    }
-    if (savedSafeDraft?.selectedDate) return savedSafeDraft.selectedDate;
-    return '';
+    const candidate =
+      triageDraftForBooking?.preferredDate || savedSafeDraft?.selectedDate || tomorrowManila;
+    return candidate > todayManila ? candidate : tomorrowManila;
   });
+
   const [selectedTimeSlot, setSelectedTimeSlot] = useState<string>('');
-  const [visitType, setVisitType] = useState<
-    'Consultation' | 'Follow-up' | 'Check-up' | 'Emergency' | 'Telehealth'
-  >(() => {
-    if (savedSafeDraft?.visitType) return savedSafeDraft.visitType;
-    return 'Consultation';
-  });
-
-  const [reason, setReason] = useState<string>(() => {
-    if (triageDraftForBooking?.reason) return triageDraftForBooking.reason;
-    if (savedSafeDraft?.reason) return savedSafeDraft.reason;
-    return '';
-  });
+  const [sameDayAttemptNotice, setSameDayAttemptNotice] = useState<string | null>(null);
   const [staffOverrideReason, setStaffOverrideReason] = useState<string>('');
-
-  const [confirmedAppointment, setConfirmedAppointment] = useState<Appointment | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
 
-  // Persist non-sensitive booking draft (no PHI/MRN/patient identity) so form progress survives inactivity timeout
+  const [confirmedAppointment, setConfirmedAppointment] = useState<Appointment | null>(null);
+  const [confirmedQrDataUrl, setConfirmedQrDataUrl] = useState<string>('');
+
+  const [selectedPatId, setSelectedPatId] = useState<string>(
+    (isPatientLocked ? linkedPatientId : null) || initialPatientId || patientOptions[0]?.id || ''
+  );
+  const effectivePatId = isPatientLocked ? linkedPatientId || selectedPatId : selectedPatId;
+  const selectedPatient =
+    patientOptions.find((p) => p.id === effectivePatId) ||
+    patients.find((p) => p.id === effectivePatId) ||
+    patientOptions[0];
+
+  // Persist non-PHI draft
   useEffect(() => {
+    if (currentStep === 4) return;
     try {
-      if (currentStep === 5) return;
       localStorage.setItem(
         SAFE_BOOKING_DRAFT_KEY,
         JSON.stringify({
+          selectedBranch,
           selectedSpecialty,
           selectedDoctorId,
           selectedDate,
-          visitType,
+          consultationMode,
           reason: reason.slice(0, 120),
         })
       );
     } catch {}
-  }, [selectedSpecialty, selectedDoctorId, selectedDate, visitType, reason, currentStep]);
+  }, [
+    selectedBranch,
+    selectedSpecialty,
+    selectedDoctorId,
+    selectedDate,
+    consultationMode,
+    reason,
+    currentStep,
+  ]);
 
-  // Selected Patient
-  const [selectedPatId, setSelectedPatId] = useState<string>(
-    (isPatientLocked ? linkedPatientId : null) || initialPatientId || patientOptions[0]?.id || ''
-  );
-  const effectivePatId = isPatientLocked ? (linkedPatientId || selectedPatId) : selectedPatId;
-  const selectedPatient = patientOptions.find((p) => p.id === effectivePatId) || patients.find((p) => p.id === effectivePatId) || patients[0];
-  const selectedDoctor = doctors.find((d) => d.id === selectedDoctorId) || doctors[0];
-  const selectedDoctorSchedule = useMemo(() => {
-    return getDoctorSchedule(selectedDoctorId, selectedDoctor);
-  }, [selectedDoctorId, selectedDoctor]);
+  const [calendarMonth, setCalendarMonth] = useState<Date>(() => {
+    const [y, m] = tomorrowManila.split('-').map(Number);
+    return new Date(y, m - 1, 1);
+  });
 
-  // Calendar monthly view navigation
-  const [calendarMonth, setCalendarMonth] = useState<Date>(() => new Date());
-
-  const prevMonth = () => {
-    setCalendarMonth((prev) => new Date(prev.getFullYear(), prev.getMonth() - 1, 1));
-  };
-
-  const nextMonth = () => {
-    setCalendarMonth((prev) => new Date(prev.getFullYear(), prev.getMonth() + 1, 1));
-  };
-
-  // Filtered doctors list based on selected specialty
-  const filteredDoctors = useMemo(() => {
-    if (selectedSpecialty === 'all') return doctors;
-    return doctors.filter(
-      (d) => d.department === selectedSpecialty || d.specialty?.includes(selectedSpecialty)
-    );
-  }, [doctors, selectedSpecialty]);
-
-  // Calendar days grid computation
   const calendarGrid = useMemo(() => {
     const year = calendarMonth.getFullYear();
     const month = calendarMonth.getMonth();
-
-    const firstDayIndex = new Date(year, month, 1).getDay(); // 0 is Sunday
+    const firstDayIndex = new Date(year, month, 1).getDay();
     const totalDaysInMonth = new Date(year, month + 1, 0).getDate();
+    const clinicAppointments = allClinicAppointments || appointments;
 
     const days: Array<{
       dateString: string;
       dayNumber: number;
-      isCurrentMonth: boolean;
       isPast: boolean;
+      isTodayManila: boolean;
+      isBlockedDate: boolean;
       isWorkDay: boolean;
       availableSlotsCount: number;
     }> = [];
 
-    const todayDateStr = getManilaDateString();
-    const clinicAppointments = allClinicAppointments || appointments;
-
     for (let day = 1; day <= totalDaysInMonth; day++) {
       const dateString = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-      const isWorkDay = isDoctorWorkingOnDate(selectedDoctor?.id || '', dateString, selectedDoctor);
-      const isPast = dateString < todayDateStr;
-
-      // Check slot availability for this doctor on this day using doctor's personal schedule and full clinic bookings
-      const daySlots = getDoctorSlotAvailability(selectedDoctor?.id || '', dateString, clinicAppointments, undefined, selectedDoctor);
-      const availableSlotsCount = (isWorkDay && !isPast) ? daySlots.filter((s) => s.isAvailable).length : 0;
+      const isPast = dateString < todayManila;
+      const isTodayManila = dateString === todayManila;
+      const isBlockedDate = dateString <= todayManila;
+      const isWorkDay = selectedDoctor
+        ? isDoctorWorkingOnDate(selectedDoctor.id, dateString, selectedDoctor)
+        : false;
+      const daySlots =
+        selectedDoctor && isWorkDay && !isBlockedDate
+          ? getDoctorSlotAvailability(
+              selectedDoctor.id,
+              dateString,
+              clinicAppointments,
+              undefined,
+              selectedDoctor
+            )
+          : [];
+      const availableSlotsCount = daySlots.filter((s) => s.isAvailable).length;
 
       days.push({
         dateString,
         dayNumber: day,
-        isCurrentMonth: true,
         isPast,
+        isTodayManila,
+        isBlockedDate,
         isWorkDay,
         availableSlotsCount,
       });
     }
 
     return { firstDayIndex, days };
-  }, [calendarMonth, selectedDoctor, allClinicAppointments, appointments]);
+  }, [calendarMonth, todayManila, selectedDoctor, allClinicAppointments, appointments]);
 
-  // Slots for the currently selected date: ONLY matching doctor's personal individual schedule
   const slotAvailability = useMemo(() => {
-    if (!selectedDate || !selectedDoctor) return [];
+    if (!selectedDate || !selectedDoctor || selectedDate <= todayManila) return [];
     const clinicAppointments = allClinicAppointments || appointments;
-    return getDoctorSlotAvailability(selectedDoctor.id, selectedDate, clinicAppointments, undefined, selectedDoctor);
-  }, [selectedDate, selectedDoctor, allClinicAppointments, appointments]);
+    return getDoctorSlotAvailability(
+      selectedDoctor.id,
+      selectedDate,
+      clinicAppointments,
+      undefined,
+      selectedDoctor
+    );
+  }, [selectedDate, selectedDoctor, todayManila, allClinicAppointments, appointments]);
 
-  // Available slots count for selected date
-  const remainingSlotsForSelectedDate = useMemo(() => {
-    return slotAvailability.filter((s) => s.isAvailable).length;
-  }, [slotAvailability]);
-
-  // Same-day No-Show rebooking policy check (Asia/Manila)
   const rebookPolicyStatus = useMemo(() => {
     if (!selectedPatient || !selectedDate) {
       return { allowed: true, requiresStaffOverride: false, overriddenByStaff: false };
@@ -259,627 +355,627 @@ export const BookAppointmentModal: React.FC<Props> = ({ initialPatientId, onClos
       actorRole: activeRole,
       staffOverrideReason,
     });
-  }, [selectedPatient, selectedDate, allClinicAppointments, appointments, activeRole, staffOverrideReason]);
-
-  // Handle final submission
-  const handleConfirmBooking = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedPatient || !selectedDoctor || !selectedDate || !selectedTimeSlot) return;
-
-    const clinicAppointments = allClinicAppointments || appointments;
-
-    // 1. Enforce Same-Day No-Show Rebooking Policy
-    const rebookCheck = canPatientRebookOnDate({
-      patientId: selectedPatient.id,
-      targetDate: selectedDate,
-      appointments: clinicAppointments,
-      actorRole: activeRole,
-      staffOverrideReason,
-    });
-    if (!rebookCheck.allowed) {
-      setBookingError(
-        rebookCheck.reason ||
-          'Same-day automatic rebooking is blocked after a missed (No-Show) appointment.'
-      );
-      return;
-    }
-
-    // 2. Enforce Double-Booking & Duplicate Active Queue Guard
-    const slotGuard = validateAppointmentSlotBooking({
-      patientId: selectedPatient.id,
-      doctorId: selectedDoctor.id,
-      date: selectedDate,
-      time: normalizeTimeTo24Hour(selectedTimeSlot),
-      appointments: clinicAppointments,
-      checkDuplicateQueue: false,
-    });
-    if (!slotGuard.valid) {
-      setBookingError(slotGuard.error || 'Selected time slot is already reserved.');
-      return;
-    }
-    setBookingError(null);
-
-    // Map visitType to Appointment type
-    const mappedType: Appointment['type'] =
-      visitType === 'Emergency'
-        ? 'Emergency'
-        : visitType === 'Follow-up'
-        ? 'Follow-up'
-        : visitType === 'Check-up'
-        ? 'Check-up'
-        : visitType === 'Telehealth'
-        ? 'Telehealth'
-        : 'Consultation';
-
-    const newApt = addAppointment({
-      patientId: selectedPatient.id,
-      patientName: selectedPatient.fullName,
-      patientMrn: selectedPatient.mrn,
-      doctorId: selectedDoctor.id,
-      doctorName: selectedDoctor.name,
-      department: selectedDoctor.department || 'Outpatient Clinic',
-      date: selectedDate,
-      time: selectedTimeSlot,
-      durationMinutes: 30,
-      reason: reason ? `[${visitType}] ${reason}` : `Scheduled ${visitType} consultation`,
-      status: 'Scheduled',
-      type: mappedType,
-      room: selectedDoctor.department?.includes('Cardio') ? 'Cardiology Suite 1' : 'Room 302',
-      staffOverrideReason: rebookCheck.overriddenByStaff ? staffOverrideReason.trim() : undefined,
-    });
-
-    if (rebookCheck.overriddenByStaff) {
-      logAction(
-        'NOSHOW_REBOOK_OVERRIDE',
-        'Appointment',
-        newApt.id,
-        `Authorized same-day rebooking override after No-Show for ${selectedPatient.fullName}: ${staffOverrideReason.trim()}`
-      );
-    }
-
-    try {
-      localStorage.removeItem(SAFE_BOOKING_DRAFT_KEY);
-    } catch {}
-
-    // Create a live notification for patient confirmation with approval notice (strictly scoped to this patient)
-    addNotification({
-      recipientId: selectedPatient.id,
-      patientId: selectedPatient.id,
-      recipientRole: 'patient',
-      targetRole: 'patient',
-      title: 'Appointment Recorded',
-      message: 'Your appointment has been recorded. Please wait for approval.',
-      content: `Your appointment request with ${selectedDoctor.name} on ${selectedDate} at ${formatTimeSlot(selectedTimeSlot)} (${visitType}) has been recorded. Please wait for clinic staff confirmation. Assigned Queue Station: ${newApt.queueNumber}.`,
-      category: 'appointment',
-      priority: visitType === 'Emergency' ? 'high' : 'normal',
-      relatedResourceId: newApt.id,
-      relatedResourceType: 'appointment',
-    });
-
-    // Also notify attending provider (strictly scoped to this doctor)
-    addNotification({
-      recipientId: selectedDoctor.id,
-      doctorId: selectedDoctor.id,
-      recipientRole: 'doctor',
-      targetRole: 'provider',
-      title: 'New Patient Booking Pending Approval',
-      message: `${selectedPatient.fullName} booked a consultation on ${selectedDate} at ${formatTimeSlot(selectedTimeSlot)} (${visitType}).`,
-      content: `New confirmed appointment scheduled: ${selectedPatient.fullName} (${selectedPatient.mrn}) with Dr. ${selectedDoctor.name} on ${selectedDate} at ${formatTimeSlot(selectedTimeSlot)} (${visitType}). Review required.`,
-      category: 'appointment',
-      priority: visitType === 'Emergency' ? 'high' : 'normal',
-      relatedResourceId: newApt.id,
-      relatedResourceType: 'appointment',
-    });
-
-    setConfirmedAppointment(newApt);
-    setCurrentStep(5); // Success confirmation step
-  };
-
-  const monthNames = [
-    'January', 'February', 'March', 'April', 'May', 'June',
-    'July', 'August', 'September', 'October', 'November', 'December'
-  ];
+  }, [
+    selectedPatient,
+    selectedDate,
+    allClinicAppointments,
+    appointments,
+    activeRole,
+    staffOverrideReason,
+  ]);
 
   const handleModalClose = () => {
     setTriageDraftForBooking(null);
     onClose();
   };
 
+  const handleConfirmBooking = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedPatient || !selectedDoctor || !selectedDate || !selectedTimeSlot) return;
+
+    const dateCheck = validatePatientBookingDateManila(selectedDate);
+    if (!dateCheck.valid) {
+      setBookingError(dateCheck.error || NO_SAME_DAY_BOOKING_MESSAGE);
+      return;
+    }
+
+    const clinicAppointments = allClinicAppointments || appointments;
+    const slotGuard = validateAppointmentSlotBooking({
+      patientId: selectedPatient.id,
+      doctorId: selectedDoctor.id,
+      date: selectedDate,
+      time: normalizeTimeTo24Hour(selectedTimeSlot),
+      durationMinutes: 30,
+      appointments: clinicAppointments,
+      checkDuplicateQueue: false,
+    });
+
+    if (!slotGuard.valid) {
+      setBookingError(slotGuard.error || 'Selected time slot is already booked.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    setBookingError(null);
+
+    try {
+      const response = await createAppointmentVerified({
+        patientId: selectedPatient.id,
+        patientName: selectedPatient.fullName,
+        patientMrn: selectedPatient.mrn,
+        doctorId: selectedDoctor.id,
+        doctorName: selectedDoctor.name,
+        department: selectedDoctor.specialty || selectedDoctor.department || selectedSpecialty,
+        branch: selectedBranch,
+        date: selectedDate,
+        time: normalizeTimeTo24Hour(selectedTimeSlot),
+        durationMinutes: 30,
+        reason: reason.trim() || 'Scheduled outpatient consultation',
+        status: 'Confirmed',
+        consultationMode,
+        type: consultationMode === 'Online Consultation' ? 'Online Consultation' : 'In-Person',
+        isWalkIn: false,
+        room:
+          consultationMode === 'Online Consultation'
+            ? 'Private Teleconsultation Room'
+            : selectedBranch === 'Annex Satellite Clinic'
+            ? 'Annex Consult Room 2'
+            : 'Main Clinic Suite 302',
+        staffOverrideReason: rebookPolicyStatus.overriddenByStaff
+          ? staffOverrideReason.trim()
+          : undefined,
+      });
+
+      if (!response.success || !response.appointment) {
+        setBookingError(response.error || 'Unable to save appointment. Please choose another slot.');
+        setIsSubmitting(false);
+        return;
+      }
+
+      const savedApt = response.appointment;
+      setConfirmedAppointment(savedApt);
+
+      // Generate strictly non-PHI QR image for In-Person check-in
+      const nonPhiQrString =
+        response.qrPayload ||
+        savedApt.qrPayload ||
+        JSON.stringify({
+          v: 2,
+          ref: savedApt.bookingReference || savedApt.id,
+          token: savedApt.qrToken || 'verified-ref',
+        });
+
+      try {
+        const dataUrl = await QRCode.toDataURL(nonPhiQrString, {
+          width: 210,
+          margin: 1,
+          color: { dark: '#0f172a', light: '#ffffff' },
+        });
+        setConfirmedQrDataUrl(dataUrl);
+      } catch {
+        setConfirmedQrDataUrl('');
+      }
+
+      try {
+        localStorage.removeItem(SAFE_BOOKING_DRAFT_KEY);
+      } catch {}
+
+      setCurrentStep(4);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const monthNames = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ];
+
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
-      <div
-        className="bg-white dark:bg-slate-900 rounded-3xl shadow-2xl border border-slate-200 dark:border-slate-800 w-full max-w-2xl overflow-hidden font-sans my-auto animate-in zoom-in-95 duration-150 select-none text-slate-800 dark:text-slate-100"
-      >
-        {/* Header Bar */}
-        <div className="p-4 sm:p-5 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between bg-slate-50/80 dark:bg-slate-900/60">
+    <div
+      className="fixed inset-0 z-50 bg-slate-900/65 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="book-appointment-title"
+    >
+      <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 w-full max-w-2xl overflow-hidden text-xs font-sans my-4">
+        {/* Header */}
+        <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-2xl bg-teal-50 dark:bg-teal-950/60 border border-teal-200 dark:border-teal-800/60 flex items-center justify-center text-teal-600 dark:text-teal-300 font-bold shadow-2xs">
-              <CalendarIcon className="w-5 h-5" />
+            <div className="w-9 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center">
+              <CalendarCheck className="w-5 h-5" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-sm sm:text-base font-black tracking-tight text-slate-900 dark:text-white">
-                  Book Clinical Appointment
-                </h2>
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-100 dark:bg-teal-950 text-teal-800 dark:text-teal-300 border border-teal-200 dark:border-teal-800 uppercase tracking-wider">
-                  Live Slots
-                </span>
-              </div>
+              <h2
+                id="book-appointment-title"
+                className="text-sm sm:text-base font-bold text-slate-900 dark:text-white"
+              >
+                Schedule Outpatient Appointment
+              </h2>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                Doctor availability schedule & automated single-slot locking
+                Auto-confirmed slot reservation • Asia/Manila clinic schedule
               </p>
             </div>
           </div>
-
           <button
             type="button"
             onClick={handleModalClose}
-            className="p-2 rounded-xl text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
-            aria-label="Close"
+            aria-label="Close booking dialog"
+            className="p-2 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
           >
-            <X className="w-5 h-5" />
+            <X className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Step Indicator (Steps 1 to 4) */}
-        {currentStep !== 5 && (
-          <div className="px-5 pt-3 pb-2 border-b border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-900/40">
-            <div className="flex items-center justify-between text-xs">
-              {[
-                { step: 1, label: '1. Select Doctor' },
-                { step: 2, label: '2. Select Date' },
-                { step: 3, label: '3. Choose Slot' },
-                { step: 4, label: '4. Confirm' },
-              ].map((item) => (
-                <button
-                  key={item.step}
-                  type="button"
-                  disabled={item.step > currentStep}
-                  onClick={() => setCurrentStep(item.step as any)}
-                  className={`flex items-center gap-1.5 font-bold transition ${
-                    currentStep === item.step
-                      ? 'text-teal-600 dark:text-teal-400'
-                      : item.step < currentStep
-                      ? 'text-slate-700 dark:text-slate-300 cursor-pointer'
-                      : 'text-slate-400 dark:text-slate-600 cursor-not-allowed opacity-60'
-                  }`}
-                >
-                  <span
-                    className={`w-5 h-5 rounded-full text-[10px] flex items-center justify-center font-bold ${
-                      currentStep === item.step
-                        ? 'bg-teal-600 text-white'
-                        : item.step < currentStep
-                        ? 'bg-teal-100 dark:bg-teal-950 text-teal-800 dark:text-teal-300'
-                        : 'bg-slate-200 dark:bg-slate-800 text-slate-500'
-                    }`}
-                  >
-                    {item.step < currentStep ? '✓' : item.step}
-                  </span>
-                  <span className="hidden sm:inline text-[11px]">{item.label}</span>
-                </button>
-              ))}
+        {/* Step Indicator */}
+        {currentStep < 4 && (
+          <div className="px-5 py-2.5 bg-slate-100/70 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-800 grid grid-cols-3 gap-2 text-[11px] font-semibold">
+            <div
+              className={`flex items-center gap-1.5 ${
+                currentStep === 1
+                  ? 'text-blue-700 dark:text-blue-300 font-bold'
+                  : 'text-slate-500 dark:text-slate-400'
+              }`}
+            >
+              <span className="w-5 h-5 rounded-full bg-blue-600 text-white text-[10px] flex items-center justify-center font-mono">
+                1
+              </span>
+              <span className="truncate">Branch, Specialty &amp; Doctor</span>
+            </div>
+            <div
+              className={`flex items-center gap-1.5 ${
+                currentStep === 2
+                  ? 'text-blue-700 dark:text-blue-300 font-bold'
+                  : 'text-slate-500 dark:text-slate-400'
+              }`}
+            >
+              <span
+                className={`w-5 h-5 rounded-full text-[10px] flex items-center justify-center font-mono ${
+                  currentStep >= 2
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300'
+                }`}
+              >
+                2
+              </span>
+              <span className="truncate">Date, Slot &amp; Mode</span>
+            </div>
+            <div
+              className={`flex items-center gap-1.5 ${
+                currentStep === 3
+                  ? 'text-blue-700 dark:text-blue-300 font-bold'
+                  : 'text-slate-500 dark:text-slate-400'
+              }`}
+            >
+              <span
+                className={`w-5 h-5 rounded-full text-[10px] flex items-center justify-center font-mono ${
+                  currentStep >= 3
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300'
+                }`}
+              >
+                3
+              </span>
+              <span className="truncate">Review &amp; Auto-Confirm</span>
             </div>
           </div>
         )}
 
-        {/* Outpatient Non-Emergency Scope Notice */}
-        {currentStep !== 5 && (
-          <div className="mx-4 sm:mx-6 mt-3 px-3.5 py-2.5 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-[11px] text-slate-600 dark:text-slate-300 flex items-center gap-2">
-            <ShieldCheck className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0" />
-            <span>
-              <strong>Outpatient Clinic Services:</strong> Online booking reserves scheduled non-emergency outpatient consultations. For acute medical emergencies, call 911 or proceed to the nearest hospital ER.
-            </span>
-          </div>
-        )}
-
-        {/* Global Tomorrow Booking Notice */}
-        {triageDraftForBooking?.globalTomorrowBooking && currentStep !== 5 && (
-          <div className="mx-4 sm:mx-6 mt-3 p-3 rounded-2xl bg-teal-50 dark:bg-teal-950/60 border border-teal-200 dark:border-teal-800 text-teal-900 dark:text-teal-200 text-xs flex items-center gap-2.5">
-            <CalendarCheck className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0" />
-            <div className="text-[11px] leading-relaxed">
-              <strong>Global Tomorrow Booking Active:</strong> Under standard clinic cancellation policy, you may select any doctor or specialty for tomorrow without restrictions.
-            </div>
-          </div>
-        )}
-
-        {/* ========================================================================= */}
-        {/* STEP 1: SELECT DOCTOR & SPECIALTY                                         */}
-        {/* ========================================================================= */}
+        {/* STEP 1: BRANCH -> REASON -> SPECIALTY SUGGESTION -> DOCTOR */}
         {currentStep === 1 && (
-          <div className="p-5 sm:p-6 space-y-5 max-h-[70vh] overflow-y-auto">
-            {/* Patient Identity Confirmation */}
-            <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700/80 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <div className="w-8 h-8 rounded-xl bg-teal-100 dark:bg-teal-900/40 text-teal-700 dark:text-teal-300 flex items-center justify-center font-bold text-xs">
-                  <User className="w-4 h-4" />
-                </div>
-                <div>
-                  <p className="text-xs font-bold text-slate-900 dark:text-white">
-                    Booking for: {selectedPatient?.fullName}
-                  </p>
-                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                    MRN: <span className="font-mono font-semibold">{selectedPatient?.mrn}</span> • {selectedPatient?.age}y {selectedPatient?.gender}
-                  </p>
-                </div>
-              </div>
-
-              {!isPatientLocked && patientOptions.length > 1 && (
+          <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto">
+            {!isPatientLocked && (
+              <div>
+                <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
+                  Patient Profile
+                </label>
                 <select
-                  value={effectivePatId}
+                  value={selectedPatId}
                   onChange={(e) => setSelectedPatId(e.target.value)}
-                  className="px-2.5 py-1.5 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold"
+                  className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-semibold"
                 >
                   {patientOptions.map((p) => (
                     <option key={p.id} value={p.id}>
-                      {p.fullName}
+                      {p.fullName} ({p.mrn})
                     </option>
                   ))}
                 </select>
-              )}
-            </div>
+              </div>
+            )}
 
-            {/* Specialty Filter */}
+            {/* 1. Select Clinic Branch */}
             <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                  Filter by Clinical Department
-                </label>
-                <span className="text-[11px] font-semibold text-teal-600 dark:text-teal-400">
-                  {filteredDoctors.length} {filteredDoctors.length === 1 ? 'Physician' : 'Physicians'} Available
-                </span>
-              </div>
-              <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
-                <button
-                  type="button"
-                  onClick={() => setSelectedSpecialty('all')}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
-                    selectedSpecialty === 'all'
-                      ? 'bg-teal-600 text-white shadow-2xs'
-                      : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
-                  }`}
-                >
-                  All Specialties
-                </button>
-                {specialties.map((spec) => (
-                  <button
-                    key={spec}
-                    type="button"
-                    onClick={() => setSelectedSpecialty(spec)}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer shrink-0 ${
-                      selectedSpecialty === spec
-                        ? 'bg-teal-600 text-white shadow-2xs'
-                        : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
-                    }`}
-                  >
-                    {spec}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Doctor Cards Selection */}
-            <div className="space-y-3">
-              <label className="block text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                Select Attending Physician
+              <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1.5">
+                1. Select Clinic Branch
               </label>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {filteredDoctors.map((doc) => {
-                  const isSelected = selectedDoctorId === doc.id;
-                  const docSchedule = getDoctorSchedule(doc.id, doc);
-
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {CLINIC_BRANCHES.map((branch) => {
+                  const active = selectedBranch === branch;
                   return (
-                    <div
-                      key={doc.id}
+                    <button
+                      key={branch}
+                      type="button"
                       onClick={() => {
-                        if (selectedDoctorId !== doc.id) {
-                          setSelectedDoctorId(doc.id);
-                          setSelectedTimeSlot('');
-                          if (selectedDate && !isDoctorWorkingOnDate(doc.id, selectedDate)) {
-                            setSelectedDate('');
-                          }
-                        }
+                        setSelectedBranch(branch);
+                        setSelectedTimeSlot('');
                       }}
-                      className={`p-4 rounded-2xl border-2 transition cursor-pointer flex flex-col justify-between gap-3 ${
-                        isSelected
-                          ? 'border-teal-500 bg-teal-50/50 dark:bg-teal-950/40 shadow-sm'
-                          : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-800/60 hover:border-teal-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+                      className={`p-3 rounded-xl border text-left transition cursor-pointer flex items-center gap-2.5 ${
+                        active
+                          ? 'border-blue-600 bg-blue-50/80 dark:bg-blue-950/50 text-blue-900 dark:text-blue-200 ring-1 ring-blue-500'
+                          : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/60 text-slate-700 dark:text-slate-300 hover:border-slate-300'
                       }`}
                     >
+                      <Building2 className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
                       <div>
-                        <h4 className="font-bold text-sm text-slate-900 dark:text-white truncate">
-                          {doc.name}
-                        </h4>
-                        <p className="text-teal-600 dark:text-teal-400 text-xs font-semibold truncate mt-0.5">
-                          {doc.specialty || doc.department}
-                        </p>
-                        <p className="text-slate-400 text-[11px] font-mono mt-0.5">
-                          License: {doc.licenseNumber || 'MD-REG'}
-                        </p>
+                        <span className="font-bold block text-xs">{branch}</span>
+                        <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                          {branch === 'Main Outpatient Clinic'
+                            ? 'Full multi-specialty & online teleconsultations'
+                            : 'Satellite outpatient & primary consultation desk'}
+                        </span>
                       </div>
-
-                      <div className="pt-2.5 border-t border-slate-200/60 dark:border-slate-700/60 space-y-1">
-                        <div className="flex items-center justify-between text-[11px]">
-                          <span className="text-teal-700 dark:text-teal-300 font-bold flex items-center gap-1">
-                            <CalendarIcon className="w-3 h-3 text-teal-500 shrink-0" />
-                            <span>{docSchedule.workDaysLabel}</span>
-                          </span>
-                          <span
-                            className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                              isSelected
-                                ? 'bg-teal-600 text-white'
-                                : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300'
-                            }`}
-                          >
-                            {isSelected ? 'Selected' : 'Choose'}
-                          </span>
-                        </div>
-                        <p className="text-[10px] text-slate-500 dark:text-slate-400 flex items-center gap-1 font-mono">
-                          <Clock className="w-3 h-3 text-teal-500 shrink-0" />
-                          <span className="truncate">{docSchedule.hoursLabel}</span>
-                        </p>
-                      </div>
-                    </div>
+                    </button>
                   );
                 })}
               </div>
             </div>
 
-            {/* Next button */}
-            <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex justify-end gap-2">
+            {/* 2. Enter Free-Text Reason for Consultation */}
+            <div>
+              <label
+                htmlFor="booking-reason-input"
+                className="block font-bold text-slate-700 dark:text-slate-300 mb-1"
+              >
+                2. Reason for Consultation / Presenting Symptoms
+              </label>
+              <input
+                id="booking-reason-input"
+                type="text"
+                required
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                placeholder="e.g., High fever and cough for 2 days, blood pressure follow-up, skin rash"
+                className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-medium focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+
+            {/* 3. Non-Diagnostic Specialty Suggestions & 4. Select Specialty */}
+            <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-2.5">
+              <div className="flex items-start gap-2 text-[11px] text-slate-600 dark:text-slate-300">
+                <Info className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold text-slate-900 dark:text-white">
+                    3. Suggested Specialties (Non-Diagnostic Guidance):
+                  </span>{' '}
+                  <span>{NON_DIAGNOSTIC_MATCHER_DISCLAIMER}</span>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                {specialtyMatchResult.suggestions.map((sug) => {
+                  const matchingBranchSpec =
+                    branchSpecialties.find(
+                      (bs) =>
+                        bs.toLowerCase().includes(sug.specialty.toLowerCase()) ||
+                        sug.specialty.toLowerCase().includes(bs.toLowerCase())
+                    ) || sug.specialty;
+                  const isChosen =
+                    selectedSpecialty.toLowerCase() === matchingBranchSpec.toLowerCase();
+                  return (
+                    <button
+                      key={sug.specialty}
+                      type="button"
+                      onClick={() => {
+                        setSelectedSpecialty(matchingBranchSpec);
+                        setSelectedTimeSlot('');
+                      }}
+                      className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold border transition cursor-pointer whitespace-nowrap ${
+                        isChosen
+                          ? 'bg-blue-600 text-white border-blue-600'
+                          : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700 hover:border-blue-400'
+                      }`}
+                      title={sug.guidanceNote}
+                    >
+                      Recommended: {matchingBranchSpec}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div>
+                <label
+                  htmlFor="specialty-select"
+                  className="block text-[11px] font-bold text-slate-700 dark:text-slate-300 mb-1"
+                >
+                  4. Choose Specialty Manually (or keep suggestion)
+                </label>
+                <select
+                  id="specialty-select"
+                  value={selectedSpecialty}
+                  onChange={(e) => {
+                    setSelectedSpecialty(e.target.value);
+                    setSelectedTimeSlot('');
+                  }}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-semibold"
+                >
+                  <option value="ALL">All Specialties at {selectedBranch}</option>
+                  {branchSpecialties.map((spec) => (
+                    <option key={spec} value={spec}>
+                      {spec}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* 5 & 6. Available Doctors at Selected Branch */}
+            <div className="space-y-2">
+              <label className="block font-bold text-slate-700 dark:text-slate-300">
+                5. Select Available Physician at {selectedBranch} ({availableBranchDoctors.length})
+              </label>
+
+              {availableBranchDoctors.length === 0 ? (
+                <div className="p-4 rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200">
+                  No physicians for <strong>{selectedSpecialty}</strong> are scheduled at{' '}
+                  <strong>{selectedBranch}</strong>. Please select &ldquo;All Specialties&rdquo; or
+                  switch clinic branch.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-52 overflow-y-auto pr-1">
+                  {availableBranchDoctors.map((doc) => {
+                    const isSelected = doc.id === selectedDoctorId;
+                    const sched = getDoctorSchedule(doc.id, doc);
+                    const modes = doc.consultationModes || ['In-Person'];
+                    return (
+                      <button
+                        key={doc.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedDoctorId(doc.id);
+                          setSelectedTimeSlot('');
+                        }}
+                        className={`p-3 rounded-xl border text-left transition cursor-pointer space-y-1 ${
+                          isSelected
+                            ? 'border-blue-600 bg-blue-50/80 dark:bg-blue-950/50 ring-1 ring-blue-500'
+                            : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/60 hover:border-slate-300'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-bold text-slate-900 dark:text-white text-xs">
+                            {doc.name}
+                          </span>
+                          <Stethoscope className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                        </div>
+                        <p className="text-[11px] font-semibold text-blue-700 dark:text-blue-300">
+                          {doc.specialty || doc.department}
+                        </p>
+                        <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                          {sched.workDaysLabel} • {sched.hoursLabel}
+                        </p>
+                        <div className="flex flex-wrap gap-1 pt-0.5">
+                          {modes.map((m) => (
+                            <span
+                              key={m}
+                              className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200"
+                            >
+                              {m}
+                            </span>
+                          ))}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center justify-end gap-2">
               <button
                 type="button"
-                onClick={onClose}
-                className="px-4 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition cursor-pointer"
+                onClick={handleModalClose}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-semibold hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 type="button"
-                disabled={!selectedDoctorId}
-                onClick={() => setCurrentStep(2)}
-                className="px-5 py-2.5 bg-teal-600 hover:bg-teal-500 text-white rounded-xl text-xs font-bold shadow-sm transition cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+                disabled={!selectedDoctor || !reason.trim()}
+                onClick={() => {
+                  setBookingError(null);
+                  setCurrentStep(2);
+                }}
+                className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
               >
-                <span>Continue to Calendar</span>
+                <span>Select Date, Time &amp; Mode</span>
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
           </div>
         )}
 
-        {/* ========================================================================= */}
-        {/* STEP 2: SELECT DATE FROM MONTHLY CALENDAR                                 */}
-        {/* ========================================================================= */}
-        {currentStep === 2 && (
-          <div className="p-5 sm:p-6 space-y-4 max-h-[75vh] overflow-y-auto">
-            {/* Active Doctor Context Header (No photo/picture) */}
-            <div className="p-3.5 rounded-2xl bg-teal-50/60 dark:bg-teal-950/40 border border-teal-200 dark:border-teal-800/60 flex items-center justify-between gap-3">
+        {/* STEP 2: DOCTOR CALENDAR (NO SAME-DAY MANILA BOOKING) + TIME SLOT + CONSULTATION MODE */}
+        {currentStep === 2 && selectedDoctor && (
+          <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto">
+            {/* Same-Day Booking Rule Banner */}
+            <div className="p-3 rounded-xl bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 text-[11px] text-blue-950 dark:text-blue-200 flex items-start gap-2">
+              <Clock className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0 mt-0.5" />
               <div>
-                <p className="font-bold text-xs text-slate-900 dark:text-white">
-                  {selectedDoctor?.name}
+                <p className="font-bold">
+                  Asia/Manila Scheduling Policy (Today: {todayManila})
                 </p>
-                <p className="text-[11px] text-teal-700 dark:text-teal-300">
-                  {selectedDoctor?.specialty || selectedDoctor?.department} • License: {selectedDoctor?.licenseNumber || 'MD-REG'}
-                </p>
-                <p className="text-[11px] text-slate-600 dark:text-slate-300 mt-1 flex items-center gap-1 font-medium">
-                  <Clock className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 shrink-0" />
-                  <span>Personal Schedule: <strong className="text-teal-700 dark:text-teal-300">{selectedDoctorSchedule.workDaysLabel}</strong> ({selectedDoctorSchedule.hoursLabel})</span>
-                </p>
+                <p>{NO_SAME_DAY_BOOKING_MESSAGE}</p>
               </div>
+            </div>
 
-              <button
-                type="button"
-                onClick={() => setCurrentStep(1)}
-                className="text-xs text-teal-600 dark:text-teal-400 font-bold hover:underline cursor-pointer shrink-0"
+            {sameDayAttemptNotice && (
+              <div
+                role="alert"
+                className="p-3 rounded-xl bg-amber-50 dark:bg-amber-950/50 border border-amber-300 dark:border-amber-800 text-amber-950 dark:text-amber-200 font-semibold flex items-center gap-2"
               >
-                Change Doctor
-              </button>
-            </div>
-
-            {/* Month Navigator */}
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-sm font-black text-slate-900 dark:text-white">
-                  {monthNames[calendarMonth.getMonth()]} {calendarMonth.getFullYear()}
-                </h3>
-                <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Pick any available consultation day
-                </p>
+                <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>{sameDayAttemptNotice}</span>
               </div>
+            )}
 
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={prevMonth}
-                  className="p-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
-                  title="Previous Month"
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={nextMonth}
-                  className="p-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
-                  title="Next Month"
-                >
-                  <ChevronRight className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            {/* Calendar Days of Week Header */}
-            <div className="grid grid-cols-7 gap-1 text-center font-bold text-[11px] text-slate-400 uppercase tracking-wider pb-1">
-              <span>Sun</span>
-              <span>Mon</span>
-              <span>Tue</span>
-              <span>Wed</span>
-              <span>Thu</span>
-              <span>Fri</span>
-              <span>Sat</span>
-            </div>
-
-            {/* Calendar Days Grid */}
-            <div className="grid grid-cols-7 gap-1.5">
-              {/* Empty leading padding slots */}
-              {Array.from({ length: calendarGrid.firstDayIndex }).map((_, i) => (
-                <div key={`empty-${i}`} className="h-14 sm:h-16 rounded-xl bg-slate-50/40 dark:bg-slate-900/20" />
-              ))}
-
-              {calendarGrid.days.map((dayItem) => {
-                const isSelected = selectedDate === dayItem.dateString;
-                const isUnavailable = !dayItem.isWorkDay || dayItem.isPast || dayItem.availableSlotsCount === 0;
-                const badgeLabel = !dayItem.isWorkDay
-                  ? 'Doctor Off'
-                  : dayItem.isPast
-                  ? 'Past'
-                  : dayItem.availableSlotsCount === 0
-                  ? 'Full'
-                  : `${dayItem.availableSlotsCount} open`;
-
-                return (
+            {/* 7 & 8. Available Dates Calendar */}
+            <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-700 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="font-bold text-slate-900 dark:text-white text-xs block">
+                    {monthNames[calendarMonth.getMonth()]} {calendarMonth.getFullYear()}
+                  </span>
+                  <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                    {selectedDoctor.name} • {selectedDoctorSchedule?.workDaysLabel}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1">
                   <button
-                    key={dayItem.dateString}
                     type="button"
-                    disabled={isUnavailable}
-                    onClick={() => {
-                      setSelectedDate(dayItem.dateString);
-                      // Reset previously selected time slot if date changes
-                      setSelectedTimeSlot('');
-                    }}
-                    className={`h-14 sm:h-16 rounded-xl p-1.5 flex flex-col justify-between items-center transition border text-xs cursor-pointer ${
-                      isSelected
-                        ? 'bg-teal-600 text-white border-teal-600 font-bold shadow-md shadow-teal-900/30 ring-2 ring-teal-400'
-                        : isUnavailable
-                        ? 'bg-slate-100/60 dark:bg-slate-800/40 border-slate-200/60 dark:border-slate-800 text-slate-400 dark:text-slate-600 cursor-not-allowed opacity-60'
-                        : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 hover:border-teal-400 hover:bg-teal-50/50 dark:hover:bg-teal-950/30'
-                    }`}
+                    aria-label="Previous month"
+                    onClick={() =>
+                      setCalendarMonth(
+                        (prev) => new Date(prev.getFullYear(), prev.getMonth() - 1, 1)
+                      )
+                    }
+                    className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
                   >
-                    <span className="text-xs sm:text-sm font-bold">{dayItem.dayNumber}</span>
-                    <span
-                      className={`text-[9px] px-1 rounded font-semibold truncate ${
-                        isSelected
-                          ? 'bg-teal-700 text-teal-100'
-                          : isUnavailable
-                          ? 'text-slate-400 dark:text-slate-500'
-                          : 'bg-teal-50 dark:bg-teal-900/40 text-teal-700 dark:text-teal-300 border border-teal-200 dark:border-teal-800'
-                      }`}
-                    >
-                      {badgeLabel}
-                    </span>
+                    <ChevronLeft className="w-4 h-4" />
                   </button>
-                );
-              })}
-            </div>
-
-            {/* Footer / Step Actions */}
-            <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
-              <button
-                type="button"
-                onClick={() => setCurrentStep(1)}
-                className="px-4 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition cursor-pointer flex items-center gap-1"
-              >
-                <ChevronLeft className="w-4 h-4" />
-                <span>Back</span>
-              </button>
-
-              <button
-                type="button"
-                disabled={!selectedDate}
-                onClick={() => setCurrentStep(3)}
-                className="px-5 py-2.5 bg-teal-600 hover:bg-teal-500 text-white rounded-xl text-xs font-bold shadow-sm transition cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
-              >
-                <span>Choose Time Slot</span>
-                <ChevronRight className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* ========================================================================= */}
-        {/* STEP 3: SELECT TIME SLOT & VISIT DETAILS                                  */}
-        {/* ========================================================================= */}
-        {currentStep === 3 && (
-          <div className="p-5 sm:p-6 space-y-5 max-h-[75vh] overflow-y-auto">
-            {/* Summary Context */}
-            <div className="p-3.5 rounded-2xl bg-teal-50/60 dark:bg-teal-950/40 border border-teal-200 dark:border-teal-800/60 flex items-center justify-between gap-3">
-              <div>
-                <p className="font-bold text-xs text-slate-900 dark:text-white">
-                  {selectedDoctor?.name} • {selectedDate}
-                </p>
-                <p className="text-[11px] text-teal-700 dark:text-teal-300 font-medium flex items-center gap-1 mt-0.5">
-                  <Clock className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 shrink-0" />
-                  <span>{selectedDoctorSchedule.workDaysLabel} • {selectedDoctorSchedule.hoursLabel}</span>
-                </p>
-                <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                  {remainingSlotsForSelectedDate} open slots available on this date
-                </p>
+                  <button
+                    type="button"
+                    aria-label="Next month"
+                    onClick={() =>
+                      setCalendarMonth(
+                        (prev) => new Date(prev.getFullYear(), prev.getMonth() + 1, 1)
+                      )
+                    }
+                    className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setCurrentStep(2)}
-                className="text-xs text-teal-600 dark:text-teal-400 font-bold hover:underline cursor-pointer shrink-0"
-              >
-                Change Date
-              </button>
+
+              <div className="grid grid-cols-7 gap-1 text-center text-[10px] font-bold text-slate-400 uppercase">
+                <span>Sun</span>
+                <span>Mon</span>
+                <span>Tue</span>
+                <span>Wed</span>
+                <span>Thu</span>
+                <span>Fri</span>
+                <span>Sat</span>
+              </div>
+
+              <div className="grid grid-cols-7 gap-1 tabular-nums">
+                {Array.from({ length: calendarGrid.firstDayIndex }).map((_, idx) => (
+                  <div key={`pad-${idx}`} className="h-11" />
+                ))}
+                {calendarGrid.days.map((day) => {
+                  const isSelected = selectedDate === day.dateString;
+                  const canSelect =
+                    !day.isBlockedDate && day.isWorkDay && day.availableSlotsCount > 0;
+
+                  return (
+                    <button
+                      key={day.dateString}
+                      type="button"
+                      aria-disabled={!canSelect}
+                      onClick={() => {
+                        if (day.isBlockedDate) {
+                          setSameDayAttemptNotice(NO_SAME_DAY_BOOKING_MESSAGE);
+                          return;
+                        }
+                        if (!canSelect) return;
+                        setSameDayAttemptNotice(null);
+                        setSelectedDate(day.dateString);
+                        setSelectedTimeSlot('');
+                      }}
+                      className={`h-12 rounded-lg border p-1 flex flex-col items-center justify-center transition ${
+                        isSelected
+                          ? 'bg-blue-600 text-white border-blue-600 font-bold cursor-pointer'
+                          : canSelect
+                          ? 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-900 dark:text-slate-100 hover:border-blue-400 cursor-pointer'
+                          : 'bg-slate-100/70 dark:bg-slate-800/30 border-slate-200/50 dark:border-slate-800 text-slate-400 dark:text-slate-600 cursor-not-allowed'
+                      }`}
+                      title={
+                        day.isTodayManila
+                          ? NO_SAME_DAY_BOOKING_MESSAGE
+                          : !day.isWorkDay
+                          ? 'Physician off duty'
+                          : `${day.availableSlotsCount} slots available`
+                      }
+                    >
+                      <span className="text-xs font-mono">{day.dayNumber}</span>
+                      <span
+                        className={`text-[8px] leading-none mt-0.5 ${
+                          isSelected
+                            ? 'text-blue-100'
+                            : day.isTodayManila
+                            ? 'text-amber-600 dark:text-amber-400 font-bold'
+                            : canSelect
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : 'text-slate-400'
+                        }`}
+                      >
+                        {day.isTodayManila
+                          ? 'Blocked'
+                          : day.isPast
+                          ? 'Past'
+                          : !day.isWorkDay
+                          ? 'Off'
+                          : `${day.availableSlotsCount} open`}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
-            {/* Time Slot Grid (with grayed-out booked slots) */}
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                  Doctor Available Time Slots (30 min)
+            {/* 9 & 10. Available Time Slots */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="font-bold text-slate-700 dark:text-slate-300">
+                  Available Time Slots on {selectedDate}
                 </label>
-                <span className="text-[11px] text-slate-400">
-                  Single-patient locking enforced
+                <span className="text-[11px] text-slate-500 tabular-nums">
+                  {slotAvailability.filter((s) => s.isAvailable).length} open slots
                 </span>
               </div>
 
               {slotAvailability.length === 0 ? (
-                <div className="p-6 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-center space-y-2">
-                  <AlertCircle className="w-6 h-6 text-amber-600 dark:text-amber-400 mx-auto" />
-                  <p className="text-xs font-bold text-amber-900 dark:text-amber-200">
-                    No Consultation Hours on This Date
-                  </p>
-                  <p className="text-[11px] text-amber-700 dark:text-amber-400">
-                    {selectedDoctor?.name} is not on duty on this day. Schedule: {selectedDoctorSchedule.workDaysLabel} ({selectedDoctorSchedule.hoursLabel}).
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => setCurrentStep(2)}
-                    className="mt-1 px-3 py-1.5 bg-amber-600 text-white rounded-xl text-xs font-semibold cursor-pointer hover:bg-amber-500 transition"
-                  >
-                    Select Another Date
-                  </button>
+                <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 text-center">
+                  Select an open working date starting {tomorrowManila} to view available time slots.
                 </div>
               ) : (
-                <div className="grid grid-cols-3 sm:grid-cols-4 gap-2.5">
+                <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 tabular-nums">
                   {slotAvailability.map((item) => {
                     const isSelected = selectedTimeSlot === item.slot;
-
                     return (
                       <button
                         key={item.slot}
                         type="button"
                         disabled={!item.isAvailable}
                         onClick={() => setSelectedTimeSlot(item.slot)}
-                        className={`py-2.5 px-2 rounded-xl text-xs font-bold transition flex flex-col items-center justify-center border cursor-pointer ${
+                        className={`py-2 px-2 rounded-xl border text-center transition ${
                           isSelected
-                            ? 'bg-teal-600 text-white border-teal-600 shadow-md shadow-teal-900/20 ring-2 ring-teal-400'
+                            ? 'bg-blue-600 text-white border-blue-600 font-bold cursor-pointer'
                             : item.isAvailable
-                            ? 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 hover:border-teal-400 hover:bg-teal-50 dark:hover:bg-slate-700'
-                            : 'bg-slate-100 dark:bg-slate-800/40 border-slate-200/60 dark:border-slate-800 text-slate-400 dark:text-slate-600 cursor-not-allowed opacity-50'
+                            ? 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 hover:border-blue-400 cursor-pointer font-semibold'
+                            : 'bg-slate-100 dark:bg-slate-800/40 border-slate-200/60 dark:border-slate-800 text-slate-400 line-through cursor-not-allowed'
                         }`}
                       >
-                        <span className="text-xs">{item.formatted}</span>
-                        <span
-                          className={`text-[9px] mt-0.5 uppercase tracking-wider ${
-                            isSelected
-                              ? 'text-teal-100 font-bold'
-                              : item.isAvailable
-                              ? 'text-teal-600 dark:text-teal-400'
-                              : 'text-slate-400'
-                          }`}
-                        >
+                        <span className="block text-xs font-mono">{item.formatted}</span>
+                        <span className="block text-[9px] mt-0.5">
                           {item.isAvailable ? 'Available' : 'Booked'}
                         </span>
                       </button>
@@ -889,259 +985,275 @@ export const BookAppointmentModal: React.FC<Props> = ({ initialPatientId, onClos
               )}
             </div>
 
-            {/* Consultation Details */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
-              <div>
-                <label className="block font-bold text-slate-700 dark:text-slate-300 text-xs mb-1">
-                  Encounter Type
-                </label>
-                <select
-                  value={visitType}
-                  onChange={(e) => setVisitType(e.target.value as any)}
-                  className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 cursor-pointer"
-                >
-                  <option value="Consultation">Consultation</option>
-                  <option value="Follow-up">Follow-up</option>
-                  <option value="Emergency">Emergency</option>
-                  <option value="Check-up">Check-up</option>
-                  <option value="Telehealth">Telehealth</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block font-bold text-slate-700 dark:text-slate-300 text-xs mb-1">
-                  Reason for Visit / Symptoms
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. Regular blood sugar & BP checkup"
-                  value={reason}
-                  onChange={(e) => setReason(e.target.value)}
-                  className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500"
-                />
+            {/* 11. Choose In-Person or Online Consultation */}
+            <div className="space-y-1.5">
+              <label className="block font-bold text-slate-700 dark:text-slate-300">
+                Consultation Mode (Offered by {selectedDoctor.name})
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {(['In-Person', 'Online Consultation'] as ConsultationMode[]).map((mode) => {
+                  const supported = doctorOfferedModes.includes(mode);
+                  const active = consultationMode === mode;
+                  return (
+                    <button
+                      key={mode}
+                      type="button"
+                      disabled={!supported}
+                      onClick={() => setConsultationMode(mode)}
+                      className={`p-3 rounded-xl border text-left transition flex items-center gap-2.5 ${
+                        active
+                          ? 'border-blue-600 bg-blue-50/80 dark:bg-blue-950/50 text-blue-950 dark:text-blue-100 ring-1 ring-blue-500 cursor-pointer'
+                          : supported
+                          ? 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:border-blue-400 cursor-pointer'
+                          : 'border-slate-200/60 dark:border-slate-800 bg-slate-100/60 dark:bg-slate-900 text-slate-400 cursor-not-allowed'
+                      }`}
+                    >
+                      {mode === 'Online Consultation' ? (
+                        <Video className="w-4 h-4 text-blue-600 shrink-0" />
+                      ) : (
+                        <MapPin className="w-4 h-4 text-blue-600 shrink-0" />
+                      )}
+                      <div>
+                        <span className="font-bold block text-xs">{mode}</span>
+                        <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                          {!supported
+                            ? 'Not offered by selected physician'
+                            : mode === 'In-Person'
+                            ? 'Issues non-PHI Appointment QR Code for reception check-in'
+                            : 'Private 1-to-1 browser video consultation room'}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
-            {/* Footer Buttons */}
-            <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
+            <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between">
               <button
                 type="button"
-                onClick={() => setCurrentStep(2)}
-                className="px-4 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition cursor-pointer flex items-center gap-1"
+                onClick={() => setCurrentStep(1)}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 font-semibold flex items-center gap-1 cursor-pointer"
               >
                 <ChevronLeft className="w-4 h-4" />
                 <span>Back</span>
               </button>
-
               <button
                 type="button"
-                disabled={!selectedTimeSlot}
-                onClick={() => setCurrentStep(4)}
-                className="px-5 py-2.5 bg-teal-600 hover:bg-teal-500 text-white rounded-xl text-xs font-bold shadow-sm transition cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+                disabled={!selectedDate || selectedDate <= todayManila || !selectedTimeSlot}
+                onClick={() => {
+                  setBookingError(null);
+                  setCurrentStep(3);
+                }}
+                className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
               >
-                <span>Review & Confirm</span>
+                <span>Review Booking Details</span>
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
           </div>
         )}
 
-        {/* ========================================================================= */}
-        {/* STEP 4: REVIEW & CONFIRM BOOKING                                          */}
-        {/* ========================================================================= */}
-        {currentStep === 4 && (
-          <form onSubmit={handleConfirmBooking} className="p-5 sm:p-6 space-y-5 max-h-[75vh] overflow-y-auto">
+        {/* STEP 3: REVIEW & CONFIRM (AUTO-CONFIRMATION) */}
+        {currentStep === 3 && selectedDoctor && selectedPatient && (
+          <form
+            onSubmit={handleConfirmBooking}
+            className="p-5 space-y-4 max-h-[75vh] overflow-y-auto"
+          >
             <div>
-              <h3 className="text-sm font-black text-slate-900 dark:text-white">
-                Verify Appointment Details
+              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                Review Appointment Details
               </h3>
-              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                Please review your clinical booking details prior to confirming
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Valid slot bookings are automatically confirmed upon submission without manual
+                reception approval.
               </p>
             </div>
 
-            {/* Review Card */}
-            <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-3">
-              <div className="flex items-center justify-between pb-3 border-b border-slate-200/80 dark:border-slate-700">
-                <span className="text-slate-500 text-xs">Patient</span>
-                <span className="font-bold text-slate-900 dark:text-white text-xs">
-                  {selectedPatient?.fullName} (MRN: {selectedPatient?.mrn})
+            <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-2.5 tabular-nums">
+              <div className="flex justify-between pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Patient</span>
+                <span className="font-bold text-slate-900 dark:text-white">
+                  {selectedPatient.fullName} ({selectedPatient.mrn})
                 </span>
               </div>
-
-              <div className="flex items-center justify-between pb-3 border-b border-slate-200/80 dark:border-slate-700">
-                <span className="text-slate-500 text-xs">Attending Physician</span>
-                <span className="font-bold text-teal-600 dark:text-teal-400 text-xs">
-                  {selectedDoctor?.name}
+              <div className="flex justify-between pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Clinic Branch</span>
+                <span className="font-bold text-slate-900 dark:text-white">{selectedBranch}</span>
+              </div>
+              <div className="flex justify-between pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Assigned Physician</span>
+                <span className="font-bold text-blue-700 dark:text-blue-300">
+                  {selectedDoctor.name}
                 </span>
               </div>
-
-              <div className="flex items-center justify-between pb-3 border-b border-slate-200/80 dark:border-slate-700">
-                <span className="text-slate-500 text-xs">Specialty / Dept</span>
-                <span className="font-semibold text-slate-800 dark:text-slate-200 text-xs">
-                  {selectedDoctor?.specialty || selectedDoctor?.department}
+              <div className="flex justify-between pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Specialty</span>
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  {selectedDoctor.specialty || selectedDoctor.department}
                 </span>
               </div>
-
-              <div className="flex items-center justify-between pb-3 border-b border-slate-200/80 dark:border-slate-700">
-                <span className="text-slate-500 text-xs">Date & Time</span>
-                <span className="font-black text-slate-900 dark:text-white text-xs">
+              <div className="flex justify-between pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Date &amp; Time</span>
+                <span className="font-bold text-slate-900 dark:text-white font-mono">
                   {selectedDate} at {formatTimeSlot(selectedTimeSlot)}
                 </span>
               </div>
-
-              <div className="flex items-center justify-between pb-3 border-b border-slate-200/80 dark:border-slate-700">
-                <span className="text-slate-500 text-xs">Type</span>
-                <span className="font-semibold text-slate-800 dark:text-slate-200 text-xs">
-                  {visitType} (Duration: 30 minutes)
-                </span>
+              <div className="flex justify-between pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Consultation Mode</span>
+                <span className="font-bold text-slate-900 dark:text-white">{consultationMode}</span>
               </div>
-
-              <div className="flex items-center justify-between">
-                <span className="text-slate-500 text-xs">Chief Reason</span>
-                <span className="font-medium text-slate-800 dark:text-slate-200 text-xs text-right max-w-xs">
-                  {reason || 'Outpatient consultation'}
+              <div className="flex justify-between gap-4">
+                <span className="text-slate-500 shrink-0">Reason for Consultation</span>
+                <span className="font-medium text-slate-800 dark:text-slate-200 text-right">
+                  {reason}
                 </span>
               </div>
             </div>
 
-            {/* Same-Day No-Show Rebooking Policy Guard */}
-            {rebookPolicyStatus.requiresStaffOverride && (
-              <div className="p-3.5 rounded-2xl bg-amber-50 dark:bg-amber-950/50 border border-amber-300 dark:border-amber-800 space-y-2 text-xs">
-                <div className="flex items-start gap-2 text-amber-900 dark:text-amber-200 font-bold">
-                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                  <span>
-                    {isPatientLocked
-                      ? 'Same-Day Self-Rebooking Blocked After Missed Appointment (No-Show)'
-                      : 'Staff Authorization Required: Patient Recorded as No-Show Today'}
-                  </span>
-                </div>
-                {isPatientLocked ? (
-                  <p className="text-[11px] text-amber-800 dark:text-amber-300">
-                    Automatic same-day rebooking is disabled after a missed appointment. Please go back and choose a future date, or contact clinic reception staff for assistance.
-                  </p>
-                ) : (
-                  <div>
-                    <label className="block text-[11px] font-bold text-amber-900 dark:text-amber-200 mb-1">
-                      Mandatory Staff Override Reason (logged in Security Audit Log) *
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={staffOverrideReason}
-                      onChange={(e) => setStaffOverrideReason(e.target.value)}
-                      placeholder="e.g., Patient arrived late due to transit disruption; approved by reception"
-                      className="w-full px-3 py-2 rounded-xl border border-amber-300 dark:border-amber-700 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-white"
-                    />
-                  </div>
-                )}
-              </div>
-            )}
-
             {bookingError && (
-              <div className="p-3 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-xl flex items-center gap-2 text-xs text-rose-700 dark:text-rose-300 font-semibold">
-                <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
+              <div
+                role="alert"
+                className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300 font-semibold flex items-center gap-2"
+              >
+                <AlertCircle className="w-4 h-4 shrink-0" />
                 <span>{bookingError}</span>
               </div>
             )}
 
-            {/* Privacy notice banner */}
-            <div className="p-3 bg-teal-50/70 dark:bg-teal-950/40 border border-teal-200 dark:border-teal-800/60 rounded-xl flex items-start gap-2.5 text-xs text-teal-900 dark:text-teal-200">
-              <ShieldCheck className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0 mt-0.5" />
-              <span>
-                By confirming, this slot is locked exclusively for your account under RA 10173 data privacy protection.
-              </span>
-            </div>
-
-            {/* Submit & Back buttons */}
-            <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
+            <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between">
               <button
                 type="button"
-                onClick={() => setCurrentStep(3)}
-                className="px-4 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition cursor-pointer flex items-center gap-1"
+                onClick={() => setCurrentStep(2)}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 font-semibold flex items-center gap-1 cursor-pointer"
               >
                 <ChevronLeft className="w-4 h-4" />
                 <span>Back</span>
               </button>
-
               <button
                 type="submit"
-                className="px-6 py-2.5 bg-teal-600 hover:bg-teal-500 text-white rounded-xl text-xs font-bold shadow-md shadow-teal-900/20 transition cursor-pointer flex items-center gap-2"
+                disabled={isSubmitting}
+                className="px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold flex items-center gap-2 cursor-pointer disabled:opacity-50 whitespace-nowrap"
               >
                 <CalendarCheck className="w-4 h-4" />
-                <span>Confirm & Lock Appointment</span>
+                <span>{isSubmitting ? 'Confirming Slot...' : 'Confirm Appointment'}</span>
               </button>
             </div>
           </form>
         )}
 
-        {/* ========================================================================= */}
-        {/* STEP 5: SUCCESS CONFIRMATION                                              */}
-        {/* ========================================================================= */}
-        {currentStep === 5 && (
-          <div className="p-6 sm:p-8 text-center space-y-5 animate-in zoom-in-95 duration-200">
-            <div className="w-16 h-16 rounded-3xl bg-emerald-100 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 flex items-center justify-center mx-auto shadow-lg shadow-emerald-950/20">
-              <CheckCircle2 className="w-9 h-9" />
-            </div>
-
-            <div className="space-y-1">
-              <span className="text-[10px] font-bold uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800">
-                Reservation Recorded
+        {/* STEP 4: AUTO-CONFIRMED BOOKING PASS + NON-PHI QR / ONLINE ACCESS */}
+        {currentStep === 4 && confirmedAppointment && (
+          <div className="p-6 space-y-5 max-h-[80vh] overflow-y-auto">
+            <div className="text-center space-y-1.5">
+              <div className="w-12 h-12 rounded-2xl bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 flex items-center justify-center mx-auto">
+                <CheckCircle2 className="w-7 h-7" />
+              </div>
+              <span className="inline-block text-[10px] font-bold uppercase tracking-wider px-2.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800">
+                Status: {confirmedAppointment.status}
               </span>
-              <h3 className="text-xl font-black text-slate-900 dark:text-white pt-1">
-                Your appointment has been recorded. Please wait for approval.
+              <h3 className="text-lg font-bold text-slate-900 dark:text-white">
+                Appointment Confirmed Automatically
               </h3>
-              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
-                Your appointment request with {selectedDoctor?.name} is logged in the clinic system. You will receive an alert once approved by attending staff.
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Your time slot with {confirmedAppointment.doctorName} is reserved. No manual
+                reception approval is required.
               </p>
             </div>
 
-            {confirmedAppointment && (
-              <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-xs text-left max-w-md mx-auto space-y-2">
-                <div className="flex justify-between items-center pb-2 border-b border-slate-200 dark:border-slate-700">
-                  <span className="text-slate-500">Queue Number:</span>
-                  <span className="font-mono font-bold text-teal-600 dark:text-teal-400 text-sm">
-                    {confirmedAppointment.queueNumber}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center pb-2 border-b border-slate-200 dark:border-slate-700">
-                  <span className="text-slate-500">Date & Time:</span>
-                  <span className="font-bold text-slate-800 dark:text-slate-100">
-                    {confirmedAppointment.date} at {formatTimeSlot(confirmedAppointment.time)}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center pb-2 border-b border-slate-200 dark:border-slate-700">
-                  <span className="text-slate-500">Physician:</span>
-                  <span className="font-semibold text-slate-800 dark:text-slate-100">
-                    {confirmedAppointment.doctorName}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-slate-500">Location:</span>
-                  <span className="font-medium text-slate-800 dark:text-slate-100">
-                    {confirmedAppointment.room} • Outpatient Clinic
-                  </span>
-                </div>
+            <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-2 tabular-nums">
+              <div className="flex justify-between items-center pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Booking Reference</span>
+                <span className="font-mono font-black text-sm text-blue-700 dark:text-blue-300">
+                  {confirmedAppointment.bookingReference || confirmedAppointment.id}
+                </span>
+              </div>
+              <div className="flex justify-between items-center pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Clinic Branch</span>
+                <span className="font-bold text-slate-900 dark:text-white">
+                  {confirmedAppointment.branch || selectedBranch}
+                </span>
+              </div>
+              <div className="flex justify-between items-center pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Date &amp; Time</span>
+                <span className="font-bold font-mono text-slate-900 dark:text-white">
+                  {confirmedAppointment.date} at {formatTimeSlot(confirmedAppointment.time)}
+                </span>
+              </div>
+              <div className="flex justify-between items-center pb-2 border-b border-slate-200 dark:border-slate-700">
+                <span className="text-slate-500">Physician</span>
+                <span className="font-semibold text-slate-900 dark:text-white">
+                  {confirmedAppointment.doctorName}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-500">Consultation Mode</span>
+                <span className="font-bold text-blue-700 dark:text-blue-300">
+                  {confirmedAppointment.consultationMode || consultationMode}
+                </span>
+              </div>
+            </div>
+
+            {(confirmedAppointment.consultationMode || consultationMode) === 'In-Person' ? (
+              <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 flex flex-col items-center text-center space-y-2">
+                {confirmedQrDataUrl && (
+                  <img
+                    src={confirmedQrDataUrl}
+                    alt={`Appointment QR code for ${confirmedAppointment.bookingReference}`}
+                    className="w-36 h-36 object-contain p-2 bg-white border border-slate-200 rounded-xl"
+                  />
+                )}
+                <p className="text-[11px] font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-1.5">
+                  <QrCode className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Appointment Check-In QR Pass (Contains Zero PHI)</span>
+                </p>
+                <p className="text-[10px] text-slate-500 dark:text-slate-400 max-w-md">
+                  Present this QR code to Reception or Nursing Staff on arrival. It encodes only
+                  your signed booking verification reference.
+                </p>
+              </div>
+            ) : (
+              <div className="p-4 rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50/70 dark:bg-blue-950/40 text-xs space-y-1">
+                <p className="font-bold text-blue-900 dark:text-blue-200 flex items-center gap-1.5">
+                  <Video className="w-4 h-4 text-blue-600" />
+                  <span>Online Consultation Access Assigned</span>
+                </p>
+                <p className="text-[11px] text-blue-800 dark:text-blue-300">
+                  Open your Patient Dashboard or Appointments tab at the scheduled time and click{' '}
+                  <strong>Join Online Consultation</strong> to enter the private 1-to-1 room with{' '}
+                  {confirmedAppointment.doctorName}.
+                </p>
               </div>
             )}
 
-            <div className="pt-2 flex items-center justify-center gap-3">
+            <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
+              <button
+                type="button"
+                onClick={() => printAppointmentConfirmation(confirmedAppointment)}
+                className="px-4 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span>Print Confirmation</span>
+              </button>
+              {(confirmedAppointment.consultationMode || consultationMode) === 'In-Person' && (
+                <button
+                  type="button"
+                  onClick={() => printAppointmentQr(confirmedAppointment)}
+                  className="px-4 py-2 rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/60 hover:bg-blue-100 text-blue-800 dark:text-blue-200 font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                >
+                  <QrCode className="w-3.5 h-3.5" />
+                  <span>Print Appointment QR</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
                   handleModalClose();
                   setActiveTab('appointments');
                 }}
-                className="px-5 py-2.5 bg-teal-600 hover:bg-teal-500 text-white rounded-xl text-xs font-bold transition cursor-pointer shadow-md shadow-teal-900/20"
+                className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold cursor-pointer whitespace-nowrap"
               >
-                View in My Appointments
-              </button>
-              <button
-                type="button"
-                onClick={handleModalClose}
-                className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-xl text-xs font-semibold transition cursor-pointer"
-              >
-                Close
+                View My Appointments
               </button>
             </div>
           </div>

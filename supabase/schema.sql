@@ -1,19 +1,22 @@
 -- ==============================================================================
--- Smart Clinic Outpatient Management System
--- Production Database Schema for Supabase (PostgreSQL)
--- Aligned with Philippine Health Data Security Standards (RA 10173)
+-- Smart Clinic V2 Outpatient Management System
+-- Canonical Reference Schema — Execute supabase/migrations/001_smartclinic_v2_schema_and_rls.sql
+-- Target: NEW Independent SmartClinic V2 Supabase Project ONLY
 -- ==============================================================================
 
--- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- 1. Users & Staff Directory Table
 CREATE TABLE IF NOT EXISTS public.users (
     id VARCHAR(64) PRIMARY KEY,
+    auth_user_id UUID UNIQUE REFERENCES auth.users(id) ON DELETE SET NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
     full_name VARCHAR(255) NOT NULL,
-    role VARCHAR(32) NOT NULL, -- admin, doctor, nurse, receptionist, pharmacist, lab_technician, staff, patient
-    sub_role VARCHAR(32),      -- nurse, receptionist, pharmacist, lab_tech
+    role VARCHAR(32) NOT NULL CHECK (
+      role IN ('admin', 'doctor', 'nurse', 'receptionist', 'pharmacist', 'lab_technician', 'staff', 'patient')
+    ),
+    sub_role VARCHAR(32),
     specialty VARCHAR(128),
     license_number VARCHAR(64),
     phone VARCHAR(32),
@@ -24,25 +27,31 @@ CREATE TABLE IF NOT EXISTS public.users (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- Core Role Views for Unified PostgREST Querying
-CREATE OR REPLACE VIEW public.doctors AS
-    SELECT * FROM public.users WHERE role = 'doctor';
+-- Core Role Views (Configured with security_invoker = true)
+CREATE OR REPLACE VIEW public.doctors WITH (security_invoker = true) AS
+    SELECT id, email, full_name, role, sub_role, specialty, license_number, phone, department, avatar, is_active, created_at, updated_at
+      FROM public.users WHERE role = 'doctor';
 
-CREATE OR REPLACE VIEW public.nurses AS
-    SELECT * FROM public.users WHERE role = 'nurse' OR (role = 'staff' AND sub_role = 'nurse');
+CREATE OR REPLACE VIEW public.nurses WITH (security_invoker = true) AS
+    SELECT id, email, full_name, role, sub_role, specialty, license_number, phone, department, avatar, is_active, created_at, updated_at
+      FROM public.users WHERE role = 'nurse' OR (role = 'staff' AND sub_role = 'nurse');
 
-CREATE OR REPLACE VIEW public.receptionists AS
-    SELECT * FROM public.users WHERE role = 'receptionist' OR (role = 'staff' AND sub_role = 'receptionist');
+CREATE OR REPLACE VIEW public.receptionists WITH (security_invoker = true) AS
+    SELECT id, email, full_name, role, sub_role, specialty, license_number, phone, department, avatar, is_active, created_at, updated_at
+      FROM public.users WHERE role = 'receptionist' OR (role = 'staff' AND sub_role = 'receptionist');
 
-CREATE OR REPLACE VIEW public.pharmacists AS
-    SELECT * FROM public.users WHERE role = 'pharmacist' OR (role = 'staff' AND sub_role = 'pharmacist');
+CREATE OR REPLACE VIEW public.pharmacists WITH (security_invoker = true) AS
+    SELECT id, email, full_name, role, sub_role, specialty, license_number, phone, department, avatar, is_active, created_at, updated_at
+      FROM public.users WHERE role = 'pharmacist' OR (role = 'staff' AND sub_role = 'pharmacist');
 
-CREATE OR REPLACE VIEW public.lab_technicians AS
-    SELECT * FROM public.users WHERE role = 'lab_technician' OR (role = 'staff' AND sub_role = 'lab_tech');
+CREATE OR REPLACE VIEW public.lab_technicians WITH (security_invoker = true) AS
+    SELECT id, email, full_name, role, sub_role, specialty, license_number, phone, department, avatar, is_active, created_at, updated_at
+      FROM public.users WHERE role = 'lab_technician' OR (role = 'staff' AND sub_role IN ('lab_tech', 'lab_technician'));
 
 -- 2. Patients Table
 CREATE TABLE IF NOT EXISTS public.patients (
     id VARCHAR(64) PRIMARY KEY,
+    auth_user_id UUID UNIQUE REFERENCES auth.users(id) ON DELETE SET NULL,
     mrn VARCHAR(32) UNIQUE NOT NULL,
     full_name VARCHAR(255) NOT NULL,
     dob DATE NOT NULL,
@@ -52,6 +61,7 @@ CREATE TABLE IF NOT EXISTS public.patients (
     phone VARCHAR(32) NOT NULL,
     email VARCHAR(255),
     address TEXT,
+    avatar TEXT,
     emergency_contact JSONB DEFAULT '{}'::jsonb,
     allergies JSONB DEFAULT '[]'::jsonb,
     chronic_conditions JSONB DEFAULT '[]'::jsonb,
@@ -69,18 +79,24 @@ CREATE TABLE IF NOT EXISTS public.patients (
 -- 3. Appointments Table
 CREATE TABLE IF NOT EXISTS public.appointments (
     id VARCHAR(64) PRIMARY KEY,
+    booking_reference VARCHAR(32) UNIQUE NOT NULL DEFAULT (
+      'BK-' || UPPER(SUBSTRING(REPLACE(gen_random_uuid()::text, '-', '') FROM 1 FOR 8))
+    ),
     patient_id VARCHAR(64) REFERENCES public.patients(id) ON DELETE CASCADE,
     patient_name VARCHAR(255) NOT NULL,
     patient_mrn VARCHAR(32) NOT NULL,
     doctor_id VARCHAR(64) REFERENCES public.users(id) ON DELETE SET NULL,
     doctor_name VARCHAR(255) NOT NULL,
     department VARCHAR(128) NOT NULL,
+    branch TEXT DEFAULT 'Main Outpatient Clinic' NOT NULL,
     appointment_date DATE NOT NULL,
     appointment_time VARCHAR(16) NOT NULL,
     duration_minutes INT DEFAULT 30,
     reason TEXT NOT NULL,
-    status VARCHAR(32) DEFAULT 'Scheduled' NOT NULL, -- Scheduled, Confirmed, Checked In, In Consultation, Completed, Cancelled, No Show
+    status VARCHAR(32) DEFAULT 'Scheduled' NOT NULL,
     type VARCHAR(32) DEFAULT 'In-Person',
+    is_walk_in BOOLEAN DEFAULT FALSE NOT NULL,
+    is_synthetic BOOLEAN DEFAULT FALSE NOT NULL,
     queue_number VARCHAR(16),
     room VARCHAR(64),
     notes TEXT,
@@ -95,8 +111,10 @@ CREATE TABLE IF NOT EXISTS public.consultations (
     patient_name VARCHAR(255) NOT NULL,
     doctor_id VARCHAR(64) REFERENCES public.users(id) ON DELETE SET NULL,
     doctor_name VARCHAR(255) NOT NULL,
+    branch TEXT DEFAULT 'Main Outpatient Clinic' NOT NULL,
     consultation_date DATE NOT NULL,
     chief_complaint TEXT NOT NULL,
+    symptom_categories TEXT[] DEFAULT '{}'::TEXT[] NOT NULL,
     history_of_present_illness TEXT,
     review_of_systems TEXT,
     physical_examination TEXT,
@@ -109,6 +127,7 @@ CREATE TABLE IF NOT EXISTS public.consultations (
     follow_up_instructions TEXT,
     medical_certificate_issued BOOLEAN DEFAULT FALSE,
     certificate_details JSONB,
+    is_synthetic BOOLEAN DEFAULT FALSE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
@@ -127,7 +146,7 @@ CREATE TABLE IF NOT EXISTS public.prescriptions (
     doctor_license VARCHAR(64),
     prescription_date DATE NOT NULL,
     items JSONB DEFAULT '[]'::jsonb,
-    status VARCHAR(32) DEFAULT 'Active' NOT NULL, -- Active, Dispensed, Partially Dispensed, Discontinued
+    status VARCHAR(32) DEFAULT 'Active' NOT NULL,
     ai_safety_audit JSONB,
     notes TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
@@ -161,7 +180,7 @@ CREATE TABLE IF NOT EXISTS public.lab_orders (
     test_name VARCHAR(255) NOT NULL,
     category VARCHAR(64) NOT NULL,
     urgency VARCHAR(32) DEFAULT 'Routine',
-    status VARCHAR(32) DEFAULT 'Requested' NOT NULL, -- Requested, Sample Collected, Processing, Result Available, Reviewed
+    status VARCHAR(32) DEFAULT 'Requested' NOT NULL,
     requested_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
     collected_at TIMESTAMP WITH TIME ZONE,
     completed_at TIMESTAMP WITH TIME ZONE,
@@ -179,7 +198,7 @@ CREATE TABLE IF NOT EXISTS public.lab_results (
     measured_value VARCHAR(64) NOT NULL,
     unit VARCHAR(32),
     reference_range VARCHAR(64),
-    status_flag VARCHAR(32) DEFAULT 'Normal', -- Normal, High, Low, Critical, Abnormal
+    status_flag VARCHAR(32) DEFAULT 'Normal',
     notes TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
@@ -189,7 +208,7 @@ CREATE TABLE IF NOT EXISTS public.inventory_items (
     id VARCHAR(64) PRIMARY KEY,
     sku VARCHAR(64) UNIQUE NOT NULL,
     name VARCHAR(255) NOT NULL,
-    generic_name VARCHAR(255) NOT NULL,
+    generic_name VARCHAR(255),
     brand VARCHAR(128),
     category VARCHAR(64) NOT NULL,
     batch_number VARCHAR(64) NOT NULL,
@@ -220,7 +239,7 @@ CREATE TABLE IF NOT EXISTS public.invoices (
     tax_amount DECIMAL(10,2) DEFAULT 0.00,
     total_amount DECIMAL(10,2) DEFAULT 0.00,
     paid_amount DECIMAL(10,2) DEFAULT 0.00,
-    status VARCHAR(32) DEFAULT 'Unpaid' NOT NULL, -- Unpaid, Partially Paid, Paid, Cancelled
+    status VARCHAR(32) DEFAULT 'Unpaid' NOT NULL,
     payment_method VARCHAR(64),
     payment_date TIMESTAMP WITH TIME ZONE,
     insurance_claim_status VARCHAR(32) DEFAULT 'Not Filed',
@@ -234,17 +253,18 @@ CREATE TABLE IF NOT EXISTS public.invoice_items (
     invoice_id VARCHAR(64) REFERENCES public.invoices(id) ON DELETE CASCADE,
     invoice_number VARCHAR(32),
     item_description VARCHAR(255) NOT NULL,
-    category VARCHAR(64) NOT NULL, -- Consultation, Medication, Diagnostic, Procedure, Room
+    category VARCHAR(64) NOT NULL,
     quantity INT DEFAULT 1 NOT NULL,
     unit_price DECIMAL(10,2) DEFAULT 0.00 NOT NULL,
     total_price DECIMAL(10,2) DEFAULT 0.00 NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- 12. Audit & Compliance Logs Table
+-- 12. Audit Logs Table
 CREATE TABLE IF NOT EXISTS public.audit_logs (
     id VARCHAR(64) PRIMARY KEY,
     timestamp TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
     user_id VARCHAR(64) NOT NULL,
     user_name VARCHAR(255) NOT NULL,
     user_role VARCHAR(64) NOT NULL,
@@ -252,10 +272,11 @@ CREATE TABLE IF NOT EXISTS public.audit_logs (
     resource_type VARCHAR(64) NOT NULL,
     resource_id VARCHAR(64) NOT NULL,
     description TEXT NOT NULL,
+    details JSONB DEFAULT '{}'::jsonb,
     ip_address VARCHAR(45) DEFAULT '127.0.0.1'
 );
 
--- 13. Auth Credentials Table (PBKDF2 SHA-512 Security Store)
+-- 13. Private Server-Only Auth Credentials Table (service_role ONLY)
 CREATE TABLE IF NOT EXISTS public.auth_credentials (
     email VARCHAR(255) PRIMARY KEY,
     hash VARCHAR(255) NOT NULL,
@@ -266,11 +287,10 @@ CREATE TABLE IF NOT EXISTS public.auth_credentials (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- 14. Auth OTP Store Table
+-- 14. Private Server-Only Auth OTP Store Table (service_role ONLY — no plaintext OTP column)
 CREATE TABLE IF NOT EXISTS public.auth_otps (
     key VARCHAR(255) PRIMARY KEY,
     code_hash VARCHAR(255) NOT NULL,
-    code_plain VARCHAR(16),
     channel VARCHAR(32) NOT NULL,
     destination VARCHAR(255) NOT NULL,
     purpose VARCHAR(64) NOT NULL,
@@ -280,7 +300,7 @@ CREATE TABLE IF NOT EXISTS public.auth_otps (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- Enable Row Level Security (RLS)
+-- Enable Row Level Security (RLS) — Execute supabase/migrations/001_smartclinic_v2_schema_and_rls.sql for full RBAC policies & triggers
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.patients ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.appointments ENABLE ROW LEVEL SECURITY;
@@ -295,75 +315,12 @@ ALTER TABLE public.invoice_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.auth_credentials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.auth_otps ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.auth_credentials FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.auth_otps FORCE ROW LEVEL SECURITY;
 
--- Anonymous / Authenticated PostgREST Policies
-DROP POLICY IF EXISTS "Users All Access" ON public.users;
-CREATE POLICY "Users All Access" ON public.users FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Public Read Access" ON public.patients;
-CREATE POLICY "Public Read Access" ON public.patients FOR SELECT USING (true);
-DROP POLICY IF EXISTS "Public Insert Access" ON public.patients;
-CREATE POLICY "Public Insert Access" ON public.patients FOR INSERT WITH CHECK (true);
-DROP POLICY IF EXISTS "Public Update Access" ON public.patients;
-CREATE POLICY "Public Update Access" ON public.patients FOR UPDATE USING (true);
-
-DROP POLICY IF EXISTS "Appointments All Access" ON public.appointments;
-CREATE POLICY "Appointments All Access" ON public.appointments FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Consultations All Access" ON public.consultations;
-CREATE POLICY "Consultations All Access" ON public.consultations FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Prescriptions All Access" ON public.prescriptions;
-CREATE POLICY "Prescriptions All Access" ON public.prescriptions FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Prescription Items All Access" ON public.prescription_items;
-CREATE POLICY "Prescription Items All Access" ON public.prescription_items FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Lab Orders All Access" ON public.lab_orders;
-CREATE POLICY "Lab Orders All Access" ON public.lab_orders FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Lab Results All Access" ON public.lab_results;
-CREATE POLICY "Lab Results All Access" ON public.lab_results FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Inventory All Access" ON public.inventory_items;
-CREATE POLICY "Inventory All Access" ON public.inventory_items FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Invoices All Access" ON public.invoices;
-CREATE POLICY "Invoices All Access" ON public.invoices FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Invoice Items All Access" ON public.invoice_items;
-CREATE POLICY "Invoice Items All Access" ON public.invoice_items FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Audit Logs All Access" ON public.audit_logs;
-CREATE POLICY "Audit Logs All Access" ON public.audit_logs FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Auth Credentials All Access" ON public.auth_credentials;
-CREATE POLICY "Auth Credentials All Access" ON public.auth_credentials FOR ALL USING (true);
-
-DROP POLICY IF EXISTS "Auth OTPs All Access" ON public.auth_otps;
-CREATE POLICY "Auth OTPs All Access" ON public.auth_otps FOR ALL USING (true);
-
--- Indexes for Query Performance & Data Integrity
-CREATE INDEX IF NOT EXISTS idx_users_email ON public.users(email);
-CREATE INDEX IF NOT EXISTS idx_users_role ON public.users(role);
-CREATE INDEX IF NOT EXISTS idx_patients_mrn ON public.patients(mrn);
-CREATE INDEX IF NOT EXISTS idx_appointments_date ON public.appointments(appointment_date);
-CREATE INDEX IF NOT EXISTS idx_appointments_patient ON public.appointments(patient_id);
-CREATE INDEX IF NOT EXISTS idx_appointments_doctor ON public.appointments(doctor_id);
-CREATE INDEX IF NOT EXISTS idx_consultations_patient ON public.consultations(patient_id);
-CREATE INDEX IF NOT EXISTS idx_prescriptions_patient ON public.prescriptions(patient_id);
-CREATE INDEX IF NOT EXISTS idx_prescription_items_rx ON public.prescription_items(prescription_id);
-CREATE INDEX IF NOT EXISTS idx_lab_orders_patient ON public.lab_orders(patient_id);
-CREATE INDEX IF NOT EXISTS idx_lab_results_order ON public.lab_results(order_id);
-CREATE INDEX IF NOT EXISTS idx_invoices_patient ON public.invoices(patient_id);
-CREATE INDEX IF NOT EXISTS idx_invoice_items_inv ON public.invoice_items(invoice_id);
-CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON public.audit_logs(timestamp);
-
--- Grants for Supabase PostgREST API (anon, authenticated, service_role)
+-- Least-Privilege Grants (Never grant anon/authenticated access to auth_credentials or auth_otps)
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC, anon, authenticated;
 GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
-GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
-GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
-GRANT ALL ON ALL ROUTINES IN SCHEMA public TO anon, authenticated, service_role;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON ROUTINES TO anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
+GRANT ALL ON ALL ROUTINES IN SCHEMA public TO service_role;

@@ -42,12 +42,12 @@ export const PrivacyPolicyModal: React.FC<Props> = ({ isOpen, onClose, onAgree }
             <div>
               <div className="flex items-center gap-2">
                 <span className="px-2 py-0.5 rounded-full bg-teal-100 dark:bg-teal-950 text-teal-800 dark:text-teal-300 font-extrabold text-[10px] tracking-wider uppercase border border-teal-200 dark:border-teal-800">
-                  Republic Act No. 10173
+                  Healthcare Privacy & RBAC Notice
                 </span>
-                <span className="text-[10px] text-slate-400 font-mono">DPA 2012 COMPLIANT</span>
+                <span className="text-[10px] text-slate-400 font-mono">CAPSTONE PROTOTYPE</span>
               </div>
               <h2 className="text-base sm:text-lg font-black text-slate-900 dark:text-white mt-0.5">
-                Patient Medical Privacy Policy & Consent Agreement
+                Patient Medical Privacy Notice & Consent Agreement
               </h2>
             </div>
           </div>
@@ -68,24 +68,18 @@ export const PrivacyPolicyModal: React.FC<Props> = ({ isOpen, onClose, onAgree }
               <span>Smart Clinic Patient Privacy Commitment</span>
             </div>
             <p className="text-[11px] leading-relaxed">
-              In accordance with the <strong>Republic Act No. 10173 (Data Privacy Act of 2012)</strong>, the 
-              <strong> National Privacy Commission (NPC)</strong>, and the <strong>Department of Health (DOH)</strong>, 
-              Smart Clinic strictly safeguards your electronic medical records (EMR), personal identifying information (PII), 
-              and clinical consultations. We do not sell, disclose, or share your medical data with unauthorized commercial third parties.
+              Smart Clinic applies role-based access control (RBAC), tenant isolation, and encrypted transport to safeguard electronic medical records (EMR), personal identifying information, and clinical consultations within this academic capstone prototype. Do not enter real patient health information without formal institutional and legal review.
             </p>
           </div>
 
-          {/* Section 1: Statutory Framework */}
+          {/* Section 1: Purpose & Scope */}
           <div className="space-y-2">
             <h3 className="font-bold text-slate-900 dark:text-white text-xs uppercase tracking-wider flex items-center gap-1.5">
               <FileText className="w-3.5 h-3.5 text-teal-600" />
-              <span>1. Statutory Framework & Lawful Basis</span>
+              <span>1. Processing Scope & Purpose Limitation</span>
             </h3>
             <p className="text-[11px]">
-              This policy is formulated pursuant to RA 10173 and its Implementing Rules and Regulations (IRR). 
-              Your medical health information is classified as <strong>Sensitive Personal Information (SPI)</strong> under 
-              Section 13 of RA 10173. The processing of your data is carried out strictly for medical treatment, patient care management, 
-              and outpatient health services under the supervision of licensed healthcare practitioners bound by professional confidentiality.
+              Health and scheduling information entered into Smart Clinic is processed strictly for outpatient appointment management, queue coordination, clinical documentation, and aggregated non-identifying demand forecasting by authorized clinic roles.
             </p>
           </div>
 
@@ -139,33 +133,32 @@ export const PrivacyPolicyModal: React.FC<Props> = ({ isOpen, onClose, onAgree }
           <div className="space-y-2">
             <h3 className="font-bold text-slate-900 dark:text-white text-xs uppercase tracking-wider flex items-center gap-1.5">
               <HeartHandshake className="w-3.5 h-3.5 text-teal-600" />
-              <span>4. Your Rights as a Data Subject (RA 10173 Section 16)</span>
+              <span>4. Patient Portal Controls</span>
             </h3>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
               <div className="p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
-                <strong className="block text-teal-700 dark:text-teal-300 font-bold mb-0.5">Right to Access:</strong>
-                Inspect your complete electronic medical records, lab reports, and prescriptions at any time.
+                <strong className="block text-teal-700 dark:text-teal-300 font-bold mb-0.5">Access Own Records:</strong>
+                Inspect your own electronic medical records, lab reports, and prescriptions at any time.
               </div>
               <div className="p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
-                <strong className="block text-teal-700 dark:text-teal-300 font-bold mb-0.5">Right to Rectify:</strong>
-                Request instant corrections to inaccurate demographic or medical information.
+                <strong className="block text-teal-700 dark:text-teal-300 font-bold mb-0.5">Update Contact Details:</strong>
+                Update your permitted contact and emergency details while clinical fields remain protected.
               </div>
               <div className="p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
-                <strong className="block text-teal-700 dark:text-teal-300 font-bold mb-0.5">Right to Portability:</strong>
-                Request an electronic copy of your health records in standard printable/FHIR format.
+                <strong className="block text-teal-700 dark:text-teal-300 font-bold mb-0.5">Printable Summaries:</strong>
+                Export a printable summary of your synthetic outpatient health chart from the patient portal.
               </div>
             </div>
           </div>
 
-          {/* Section 5: Data Protection Officer */}
+          {/* Section 5: System Administration Contact */}
           <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-[11px] space-y-1">
             <strong className="block font-bold text-slate-800 dark:text-slate-200">
-              Data Protection Officer (DPO) Contact Information
+              System Administrator Contact (Academic Capstone Prototype)
             </strong>
             <p>
               Smart Clinic Outpatient Health Management System<br />
-              Email: <span className="font-mono text-teal-600 dark:text-teal-400 font-bold">smartclinicrealacc@gmail.com</span> • Tel: <span className="font-semibold text-teal-600 dark:text-teal-400">Globe +639154050623</span><br />
-              National Privacy Commission Registration No: NPC-REG-2026-PH-0084
+              Email: <span className="font-mono text-teal-600 dark:text-teal-400 font-bold">smartclinicrealacc@gmail.com</span> • Synthetic Demonstration Environment
             </p>
           </div>
         </div>

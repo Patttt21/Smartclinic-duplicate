@@ -1,6 +1,6 @@
 /**
  * Smart Clinic — Enterprise Password Security & Account Protection Service
- * Compliant with Philippine Data Privacy Act (RA 10173) and NPC Security Guidelines.
+ * Implements salted PBKDF2 password hashing, lockout controls, and timing-safe verification.
  *
  * Provides:
  * 1. Cryptographic Password Hashing: PBKDF2 (SHA-512, 10,000 iterations, 16-byte random salt)
@@ -19,6 +19,32 @@ const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
 const PBKDF2_ITERATIONS = 10000;
 const SALT_BYTES = 16;
 const KEY_LENGTH = 64;
+
+const SEEDED_DEMO_ACCOUNTS: ReadonlyArray<readonly [string, string, string]> = [
+  ['smartclinicrealacc@gmail.com', 'SmartClinic@Admin2026', 'admin'],
+  ['maria.reyes@smartclinic.ph', 'doctor123', 'doctor'],
+  ['juan.santos@smartclinic.ph', 'doctor123', 'doctor'],
+  ['patricia.gomez@smartclinic.ph', 'doctor123', 'doctor'],
+  ['anthony.lee@smartclinic.ph', 'doctor123', 'doctor'],
+  ['roberto.tan@smartclinic.ph', 'doctor123', 'doctor'],
+  ['sofia.ramos@smartclinic.ph', 'doctor123', 'doctor'],
+  ['gabriel.castro@smartclinic.ph', 'doctor123', 'doctor'],
+  ['elena.torres@smartclinic.ph', 'doctor123', 'doctor'],
+  ['ana.villanueva@smartclinic.ph', 'nurse123', 'staff'],
+  ['claire.mendoza@smartclinic.ph', 'reception123', 'staff'],
+  ['julian.delacruz@smartclinic.ph', 'pharm123', 'staff'],
+  ['amina.bautista@smartclinic.ph', 'lab123', 'staff'],
+  ['elena.vargas@smartclinic.ph', 'patient123', 'patient'],
+  ['liam.torres@example.com', 'patient123', 'patient'],
+  ['sofia.rd@example.com', 'patient123', 'patient'],
+  ['david.ocampo@example.com', 'patient123', 'patient'],
+  ['amara.santos@example.com', 'patient123', 'patient'],
+  ['patrick.garcia@email.com', 'patient123', 'patient'],
+];
+
+const SEEDED_DEMO_MAP = new Map<string, { password: string; role: string }>(
+  SEEDED_DEMO_ACCOUNTS.map(([em, pw, ro]) => [em.toLowerCase(), { password: pw, role: ro }])
+);
 
 export function isCredentialRegistered(email: string): boolean {
   return authStore.hasCredentialSync(email.trim().toLowerCase());
@@ -56,25 +82,7 @@ export function registerUserCredentials(email: string, rawPassword: string, role
 }
 
 function initializeDefaultCredentials() {
-  const defaults: [string, string, string][] = [
-    ['smartclinicrealacc@gmail.com', 'SmartClinic@Admin2026', 'admin'],
-    ['maria.reyes@smartclinic.ph', 'doctor123', 'doctor'],
-    ['juan.santos@smartclinic.ph', 'doctor123', 'doctor'],
-    ['patricia.gomez@smartclinic.ph', 'doctor123', 'doctor'],
-    ['anthony.lee@smartclinic.ph', 'doctor123', 'doctor'],
-    ['roberto.tan@smartclinic.ph', 'doctor123', 'doctor'],
-    ['ana.villanueva@smartclinic.ph', 'nurse123', 'staff'],
-    ['claire.mendoza@smartclinic.ph', 'reception123', 'staff'],
-    ['julian.delacruz@smartclinic.ph', 'pharm123', 'staff'],
-    ['amina.bautista@smartclinic.ph', 'lab123', 'staff'],
-    ['elena.vargas@smartclinic.ph', 'patient123', 'patient'],
-    ['liam.torres@example.com', 'patient123', 'patient'],
-    ['sofia.rd@example.com', 'patient123', 'patient'],
-    ['david.ocampo@example.com', 'patient123', 'patient'],
-    ['amara.santos@example.com', 'patient123', 'patient'],
-  ];
-
-  for (const [em, pw, ro] of defaults) {
+  for (const [em, pw, ro] of SEEDED_DEMO_ACCOUNTS) {
     if (!authStore.hasCredentialSync(em.toLowerCase())) {
       registerUserCredentials(em, pw, ro);
     }
@@ -154,7 +162,13 @@ export async function verifyUserPassword(
   email: string,
   rawPassword: string
 ): Promise<{ success: boolean; error?: string; isLocked?: boolean; remainingAttempts?: number }> {
-  const cleanEmail = email.trim().toLowerCase();
+  const cleanEmail = String(email || '').trim().toLowerCase();
+  if (!cleanEmail || !rawPassword) {
+    return {
+      success: false,
+      error: 'Email and password are required.',
+    };
+  }
 
   const lockout = checkAccountLockout(cleanEmail);
   if (lockout.isLocked) {
@@ -168,17 +182,9 @@ export async function verifyUserPassword(
   const cred = await authStore.getCredential(cleanEmail);
 
   if (!cred || !cred.hash) {
-    const isKnownFallback =
-      (rawPassword === 'SmartClinic@Admin2026' && (cleanEmail === 'smartclinicrealacc@gmail.com' || cleanEmail.includes('admin'))) ||
-      (rawPassword === 'doctor123' && (cleanEmail.includes('doctor') || cleanEmail.endsWith('@smartclinic.ph') || ['maria.reyes@smartclinic.ph', 'juan.santos@smartclinic.ph', 'patricia.gomez@smartclinic.ph', 'anthony.lee@smartclinic.ph', 'roberto.tan@smartclinic.ph'].includes(cleanEmail))) ||
-      (rawPassword === 'nurse123' && (cleanEmail === 'ana.villanueva@smartclinic.ph' || cleanEmail.includes('nurse') || cleanEmail.includes('villanueva'))) ||
-      (rawPassword === 'reception123' && (cleanEmail === 'claire.mendoza@smartclinic.ph' || cleanEmail.includes('reception') || cleanEmail.includes('mendoza'))) ||
-      (rawPassword === 'pharm123' && (cleanEmail === 'julian.delacruz@smartclinic.ph' || cleanEmail.includes('pharm') || cleanEmail.includes('delacruz'))) ||
-      (rawPassword === 'lab123' && (cleanEmail === 'amina.bautista@smartclinic.ph' || cleanEmail.includes('lab') || cleanEmail.includes('bautista'))) ||
-      (rawPassword === 'patient123' && (cleanEmail.includes('@') || cleanEmail.includes('patient')));
-
-    if (isKnownFallback) {
-      registerUserCredentials(cleanEmail, rawPassword);
+    const exactSeeded = SEEDED_DEMO_MAP.get(cleanEmail);
+    if (exactSeeded && rawPassword === exactSeeded.password) {
+      registerUserCredentials(cleanEmail, rawPassword, exactSeeded.role);
       recordSuccessfulLogin(cleanEmail);
       return { success: true };
     }
@@ -205,7 +211,7 @@ export async function verifyUserPassword(
       return {
         success: false,
         isLocked: true,
-        error: `Security Alert: Account locked for 15 minutes due to ${MAX_FAILED_ATTEMPTS} consecutive failed attempts. (RA 10173 Audit Policy)`,
+        error: `Security Alert: Account locked for 15 minutes due to ${MAX_FAILED_ATTEMPTS} consecutive failed attempts.`,
       };
     }
     return {

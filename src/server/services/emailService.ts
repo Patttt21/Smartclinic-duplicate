@@ -1,11 +1,9 @@
 /**
- * Smart Clinic — Production Email Service (SMTP)
- * Supports all standard SMTP providers: Gmail, Outlook, SendGrid, Amazon SES, Mailgun, Postmark, etc.
+ * Smart Clinic — Transactional Email Service (SMTP)
+ * Supports standard SMTP providers (Gmail SMTP, SendGrid, Postmark, Mailgun, Amazon SES).
  * Features:
- *  - Responsive HTML + plain text email templates branded for Smart Clinic (RA 10173 compliant)
- *  - Asynchronous background queueing so HTTP requests never block
- *  - Comprehensive audit logging for all sent messages
- *  - Graceful fallback for local development/testing when SMTP is unconfigured
+ *  - Responsive HTML + plain text email templates branded for SmartClinic
+ *  - Honest reporting of configured vs unconfigured SMTP state (never claims external delivery when unconfigured)
  */
 import nodemailer from 'nodemailer';
 
@@ -78,6 +76,10 @@ export class EmailService {
     const fromEmail = process.env.SMTP_FROM_EMAIL || process.env.SMTP_FROM || process.env.SMTP_USER || 'noreply@smartclinic-v2.local';
     const fromName = process.env.SMTP_FROM_NAME || 'Smart Clinic Health (V2)';
     return `"${fromName}" <${fromEmail}>`;
+  }
+
+  public isSmtpConfigured(): boolean {
+    return this.isConfigured && Boolean(this.transporter);
   }
 
   public getStatus() {
@@ -175,34 +177,34 @@ export class EmailService {
     const is2FA = purpose === 'admin_2fa';
     const isReg = purpose === 'registration';
     const title = is2FA ? 'Admin 2FA Security Code' : isReg ? 'Verify Your Smart Clinic Account' : 'Patient Portal Login Code';
-    const subtitle = is2FA ? 'Two-Factor Authentication Security Access' : 'Republic Act No. 10173 Health Data Security';
+    const subtitle = is2FA ? 'Two-Factor Authentication Security Access' : 'SmartClinic Account Verification';
 
     const html = `
       <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 540px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; color: #0f172a;">
         <div style="text-align: center; margin-bottom: 28px;">
-          <div style="display: inline-block; width: 48px; height: 48px; line-height: 48px; background: linear-gradient(135deg, #0d9488, #0f766e); border-radius: 12px; color: #ffffff; font-size: 22px; font-weight: bold;">+</div>
-          <h2 style="color: #0d9488; margin: 12px 0 2px; font-size: 24px; font-weight: 800; letter-spacing: -0.5px;">Smart Clinic</h2>
+          <div style="display: inline-block; width: 48px; height: 48px; line-height: 48px; background: linear-gradient(135deg, #2563eb, #1d4ed8); border-radius: 12px; color: #ffffff; font-size: 22px; font-weight: bold;">+</div>
+          <h2 style="color: #1d4ed8; margin: 12px 0 2px; font-size: 24px; font-weight: 800; letter-spacing: -0.5px;">SmartClinic</h2>
           <p style="color: #64748b; font-size: 13px; margin: 0;">${subtitle}</p>
         </div>
         <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 16px; padding: 28px 20px; text-align: center; margin-bottom: 24px;">
           <p style="color: #475569; font-size: 13px; margin: 0 0 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;">${title}</p>
-          <div style="font-size: 38px; letter-spacing: 10px; font-weight: 800; color: #0f172a; font-family: monospace; background: #ffffff; padding: 14px 24px; border-radius: 10px; border: 1px dashed #0d9488; display: inline-block;">${code}</div>
+          <div style="font-size: 38px; letter-spacing: 10px; font-weight: 800; color: #0f172a; font-family: monospace; background: #ffffff; padding: 14px 24px; border-radius: 10px; border: 1px dashed #2563eb; display: inline-block;">${code}</div>
           <p style="color: #94a3b8; font-size: 12px; margin: 14px 0 0;">Valid for 10 minutes. Do not share this code with anyone.</p>
         </div>
         <p style="color: #64748b; font-size: 13px; line-height: 1.6; margin: 0 0 20px;">
-          This verification code was requested for <strong style="color: #0f172a;">${email}</strong>. If you did not initiate this request, you can safely disregard this email or report it to Smart Clinic Support.
+          This verification code was requested for <strong style="color: #0f172a;">${email}</strong>. If you did not initiate this request, you can safely disregard this email.
         </p>
         <div style="border-top: 1px solid #f1f5f9; padding-top: 20px; text-align: center;">
-          <p style="color: #94a3b8; font-size: 11px; margin: 0;">Republic Act No. 10173 • Philippine Health Data Privacy Standard</p>
+          <p style="color: #94a3b8; font-size: 11px; margin: 0;">SmartClinic Outpatient Healthcare Management Prototype</p>
         </div>
       </div>
     `;
 
-    const text = `Smart Clinic Verification Code\n\nYour 6-digit code is: ${code}\nValid for 10 minutes. Do not disclose.\nRequested for: ${email}\nRA 10173 Philippine Health Security`;
+    const text = `SmartClinic Verification Code\n\nYour 6-digit code is: ${code}\nValid for 10 minutes. Do not disclose.\nRequested for: ${email}`;
 
     return this.sendMail({
       to: email,
-      subject: `Smart Clinic — ${title} [${code}]`,
+      subject: `SmartClinic — ${title} [${code}]`,
       text,
       html,
       purpose: `otp_${purpose}`,
@@ -242,16 +244,16 @@ export class EmailService {
           </ul>
         </div>
         <div style="border-top: 1px solid #f1f5f9; padding-top: 16px; text-align: center;">
-          <p style="color: #94a3b8; font-size: 11px; margin: 0;">Republic Act No. 10173 • Certified Healthcare Privacy</p>
+          <p style="color: #94a3b8; font-size: 11px; margin: 0;">SmartClinic Outpatient Care Services</p>
         </div>
       </div>
     `;
 
-    const text = `Welcome to Smart Clinic, ${fullName}!\n\nYour patient portal account is verified.\n${mrn ? `Your MRN is: ${mrn}\n` : ''}You can now book consultations, access prescriptions, and view diagnostic test results online.\nRA 10173 Philippine Health Security`;
+    const text = `Welcome to SmartClinic, ${fullName}!\n\nYour patient portal account is verified.\n${mrn ? `Your MRN is: ${mrn}\n` : ''}You can now book consultations, access prescriptions, and view released diagnostic test results online.`;
 
     return this.sendMail({
       to: email,
-      subject: `Welcome to Smart Clinic, ${fullName}! Your Account is Verified`,
+      subject: `Welcome to SmartClinic, ${fullName}! Your Account is Verified`,
       text,
       html,
       purpose: 'welcome_email',
@@ -266,10 +268,10 @@ export class EmailService {
       <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 540px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; color: #0f172a;">
         <div style="text-align: center; margin-bottom: 24px;">
           <h2 style="color: #e11d48; margin: 0 0 6px; font-size: 24px; font-weight: 800;">Password Reset Request</h2>
-          <p style="color: #64748b; font-size: 13px; margin: 0;">Smart Clinic Security & Access Control</p>
+          <p style="color: #64748b; font-size: 13px; margin: 0;">SmartClinic Account Security</p>
         </div>
         <p style="color: #475569; font-size: 13px; line-height: 1.6;">
-          We received a request to reset your Smart Clinic password. Use the verification code below to authorize your new password:
+          We received a request to reset your SmartClinic password. Use the verification code below to authorize your new password:
         </p>
         <div style="background-color: #fff1f2; border: 1px solid #ffe4e6; border-radius: 14px; padding: 24px; text-align: center; margin: 20px 0;">
           <p style="color: #9f1239; font-size: 12px; margin: 0 0 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;">Password Reset Code</p>
@@ -277,16 +279,16 @@ export class EmailService {
           <p style="color: #9f1239; font-size: 12px; margin: 12px 0 0;">Expires in 10 minutes. If you did not make this request, please contact clinic administration.</p>
         </div>
         <div style="border-top: 1px solid #f1f5f9; padding-top: 16px; text-align: center;">
-          <p style="color: #94a3b8; font-size: 11px; margin: 0;">Republic Act No. 10173 • Philippine Health Security</p>
+          <p style="color: #94a3b8; font-size: 11px; margin: 0;">SmartClinic Account Security</p>
         </div>
       </div>
     `;
 
-    const text = `Smart Clinic Password Reset Request\n\nYour reset code is: ${code}\nValid for 10 minutes.\nIf you did not initiate this request, please notify Smart Clinic immediately.`;
+    const text = `SmartClinic Password Reset Request\n\nYour reset code is: ${code}\nValid for 10 minutes.\nIf you did not initiate this request, please notify SmartClinic immediately.`;
 
     return this.sendMail({
       to: email,
-      subject: `Smart Clinic — Password Reset Code [${code}]`,
+      subject: `SmartClinic — Password Reset Code [${code}]`,
       text,
       html,
       purpose: 'password_reset',
@@ -301,16 +303,16 @@ export class EmailService {
     const html = `
       <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 540px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; color: #0f172a;">
         <div style="text-align: center; margin-bottom: 24px;">
-          <h2 style="color: #0d9488; margin: 0 0 6px; font-size: 22px; font-weight: 800;">Security Login Alert</h2>
-          <p style="color: #64748b; font-size: 13px; margin: 0;">Smart Clinic Account Protection</p>
+          <h2 style="color: #1d4ed8; margin: 0 0 6px; font-size: 22px; font-weight: 800;">Security Login Alert</h2>
+          <p style="color: #64748b; font-size: 13px; margin: 0;">SmartClinic Account Protection</p>
         </div>
         <p style="color: #475569; font-size: 13px; line-height: 1.6;">
-          Your Smart Clinic account was recently signed into:
+          Your SmartClinic account was recently signed into:
         </p>
         <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin: 16px 0; font-size: 12px; color: #334155; line-height: 1.8;">
           <div><strong>Timestamp:</strong> ${timestamp} (PHT)</div>
           <div><strong>Device / Browser:</strong> ${details.device || 'Web Browser'}</div>
-          <div><strong>Authentication Status:</strong> Successful (RA 10173 Session Established)</div>
+          <div><strong>Authentication Status:</strong> Verified Session Established</div>
         </div>
         <p style="color: #64748b; font-size: 12px; margin: 0;">
           If this was you, no action is needed. If you did not recognize this login, please reset your password immediately.
@@ -318,11 +320,11 @@ export class EmailService {
       </div>
     `;
 
-    const text = `Smart Clinic Security Alert: Your account was signed into on ${timestamp}.\nDevice: ${details.device || 'Web'}\nIf this was not you, please reset your password immediately.`;
+    const text = `SmartClinic Security Alert: Your account was signed into on ${timestamp}.\nDevice: ${details.device || 'Web'}\nIf this was not you, please reset your password immediately.`;
 
     return this.sendMail({
       to: email,
-      subject: `Smart Clinic — New Sign-in Alert`,
+      subject: `SmartClinic — New Sign-in Alert`,
       text,
       html,
       purpose: 'security_alert',

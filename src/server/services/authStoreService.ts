@@ -237,7 +237,6 @@ class AuthStoreService {
         } else if (data && Number(data.expires_at) > now) {
           const otp: StoredOtp = {
             codeHash: data.code_hash,
-            codePlain: data.code_plain,
             channel: data.channel,
             destination: data.destination,
             purpose: data.purpose,
@@ -277,7 +276,6 @@ class AuthStoreService {
           {
             key,
             code_hash: record.codeHash,
-            code_plain: record.codePlain || null,
             channel: record.channel,
             destination: record.destination,
             purpose: record.purpose,

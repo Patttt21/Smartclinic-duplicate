@@ -130,14 +130,16 @@ export async function disablePatientPushNotifications(authToken?: string): Promi
     if (existing) {
       await existing.unsubscribe();
     }
-    await fetch('/api/push/unsubscribe', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-      },
-      body: JSON.stringify({ endpoint }),
-    });
+    if (endpoint && authToken) {
+      await fetch('/api/push/unsubscribe', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ endpoint }),
+      });
+    }
   } catch {
     // Non-fatal cleanup
   }

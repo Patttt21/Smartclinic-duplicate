@@ -205,6 +205,74 @@ export async function sendPrivacySafeQueuePush(
   return { attempted: targets.length, delivered };
 }
 
+export function hasPushSubscriptionForPatient(patientId: string): boolean {
+  initVapidConfiguration();
+  return pushSubscriptions.some((s) => s.patientId === patientId || s.userId === patientId);
+}
+
+/**
+ * Sends a privacy-safe Web Push notification for appointment confirmations, 24h/2h reminders,
+ * reschedules, or cancellations. NEVER exposes diagnoses, symptoms, or patient medical details on lock screens.
+ */
+export async function sendPrivacySafeAppointmentPush(
+  patientId: string,
+  details: {
+    appointmentId: string;
+    bookingReference?: string;
+    title: string;
+    body: string;
+    tag: string;
+    url?: string;
+  }
+): Promise<{ attempted: number; delivered: number }> {
+  initVapidConfiguration();
+  const targets = pushSubscriptions.filter(
+    (s) => s.patientId === patientId || s.userId === patientId
+  );
+  if (targets.length === 0) {
+    return { attempted: 0, delivered: 0 };
+  }
+
+  const safePayload = JSON.stringify({
+    title: details.title,
+    body: details.body,
+    tag: details.tag,
+    url: details.url || '/?tab=appointments',
+    appointmentId: details.appointmentId,
+    bookingReference: details.bookingReference || null,
+  });
+
+  let delivered = 0;
+  const expiredEndpoints = new Set<string>();
+
+  await Promise.all(
+    targets.map(async (sub) => {
+      try {
+        await webpush.sendNotification(
+          {
+            endpoint: sub.endpoint,
+            keys: sub.keys,
+          },
+          safePayload,
+          { TTL: 3600, urgency: 'normal' }
+        );
+        delivered += 1;
+      } catch (err: any) {
+        if (err?.statusCode === 404 || err?.statusCode === 410) {
+          expiredEndpoints.add(sub.endpoint);
+        }
+      }
+    })
+  );
+
+  if (expiredEndpoints.size > 0) {
+    pushSubscriptions = pushSubscriptions.filter((s) => !expiredEndpoints.has(s.endpoint));
+    persistPushSubscriptions();
+  }
+
+  return { attempted: targets.length, delivered };
+}
+
 function sendJson(ws: WebSocket, event: string, payload: unknown): void {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ event, payload, timestamp: new Date().toISOString() }));
@@ -229,6 +297,18 @@ export function emitToStaffAndAdmin(event: string, payload: unknown): number {
   let sent = 0;
   for (const client of staffAndAdminSockets) {
     if (client.ws.readyState === WebSocket.OPEN) {
+      sendJson(client.ws, event, payload);
+      sent += 1;
+    }
+  }
+  return sent;
+}
+
+export function emitToSpecificUser(userId: string, event: string, payload: unknown): number {
+  if (!userId) return 0;
+  let sent = emitToPatient(userId, event, payload);
+  for (const client of staffAndAdminSockets) {
+    if (client.user.userId === userId && client.ws.readyState === WebSocket.OPEN) {
       sendJson(client.ws, event, payload);
       sent += 1;
     }

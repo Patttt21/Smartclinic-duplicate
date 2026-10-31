@@ -4,12 +4,14 @@ import {
   Patient, User, UserRole, UserPermissions, DEFAULT_ROLE_PERMISSIONS, Appointment, AppointmentStatus, Consultation,
   Prescription, LabTestOrder, LabResultItem, InventoryItem, Invoice, InvoiceItem,
   Notification, AuditLog, Vitals, TriageRecord, UrgencyBand,
-  PaymentMethod, HMOClaimStatus, HMOPartner, HMOClaim, PaymentDetails
+  PaymentMethod, HMOClaimStatus, HMOPartner, HMOClaim, PaymentDetails,
+  InventoryTransaction, RestockRequest, ClinicOperationalSettings, NotificationPreferences, ReminderDeliveryLog
 } from '../types/clinic';
 import {
   INITIAL_PATIENTS, INITIAL_USERS, INITIAL_APPOINTMENTS, INITIAL_CONSULTATIONS,
   INITIAL_PRESCRIPTIONS, INITIAL_LAB_ORDERS, INITIAL_INVENTORY, INITIAL_INVOICES,
-  INITIAL_NOTIFICATIONS, INITIAL_AUDIT_LOGS, PHILIPPINE_HMO_PARTNERS
+  INITIAL_NOTIFICATIONS, INITIAL_AUDIT_LOGS, PHILIPPINE_HMO_PARTNERS,
+  INITIAL_INVENTORY_TRANSACTIONS, INITIAL_RESTOCK_REQUESTS
 } from '../data/mockData';
 import {
   syncPatientToSupabase, syncAppointmentToSupabase, syncConsultationToSupabase,
@@ -18,8 +20,8 @@ import {
   getSupabaseConfigInfo, isSupabaseConfigured, getSupabaseClient,
 } from '../lib/supabase';
 import { formatTimeSlot, createCustomDoctorSchedule, registerDoctorSchedule, getDoctorSchedule, normalizeTimeTo24Hour } from '../utils/doctorSchedules';
-import { applyReschedulingRule, type RescheduleComparisonResult } from '../utils/schedulingRules';
-import { disablePatientPushNotifications, showLocalBrowserQueueNotification } from '../services/pushNotificationClient';
+import { applyReschedulingRule, DEFAULT_NO_SHOW_GRACE_MINUTES, type RescheduleComparisonResult } from '../utils/schedulingRules';
+import { showLocalBrowserQueueNotification } from '../services/pushNotificationClient';
 
 import { getTranslation, type AppLanguage, type Translations } from '../utils/translations';
 
@@ -245,6 +247,48 @@ interface ClinicContextType {
   sessionSecondsRemaining: number;
   sessionTimeoutTotal: number;
   resetSessionTimer: () => void;
+  setActiveClinicalSessionProtected: (active: boolean) => void;
+  inventoryTransactions: InventoryTransaction[];
+  restockRequests: RestockRequest[];
+  clinicSettings: ClinicOperationalSettings;
+  notificationPreferences: NotificationPreferences | null;
+  reminderLogs: ReminderDeliveryLog[];
+  createAppointmentVerified: (appointment: Omit<Appointment, 'id' | 'createdAt'>) => Promise<{ success: boolean; appointment?: Appointment; qrPayload?: string; error?: string }>;
+  verifyAppointmentQr: (qrPayload: string, confirmCheckIn?: boolean, room?: string) => Promise<{
+    success: boolean;
+    checkedIn?: boolean;
+    alreadyCheckedIn?: boolean;
+    appointment?: Appointment;
+    patientSummary?: { id: string; fullName: string; mrn: string; dob?: string; age?: number; gender?: string; phone?: string };
+    error?: string;
+  }>;
+  recordPatientVitals: (
+    patientId: string,
+    vitals: Partial<Vitals> & { appointmentId?: string; isPatientReported?: boolean; source?: Vitals['source'] }
+  ) => Promise<{ success: boolean; vitals?: Vitals; error?: string }>;
+  dispensePrescription: (
+    prescriptionId: string,
+    items?: { itemId: string; quantityToDispense: number }[],
+    notes?: string
+  ) => Promise<{ success: boolean; prescription?: Prescription; transactions?: InventoryTransaction[]; lowStockAlerts?: string[]; error?: string }>;
+  updateReorderThreshold: (itemId: string, reorderLevel: number) => Promise<{ success: boolean; error?: string }>;
+  createRestockRequest: (input: { inventoryItemId: string; requestedQuantity: number; supplier?: string; notes?: string }) => Promise<{ success: boolean; request?: RestockRequest; error?: string }>;
+  updateRestockRequest: (requestId: string, input: { action: 'approve' | 'receive' | 'cancel'; receivedQuantity?: number; batchNumber?: string; expirationDate?: string }) => Promise<{ success: boolean; error?: string }>;
+  advanceLabWorkflow: (
+    orderId: string,
+    payload: {
+      action: 'verify-patient' | 'collect-sample' | 'start-processing' | 'encode-results' | 'verify-and-release' | 'amend-result' | 'doctor-acknowledge';
+      specimenType?: string;
+      specimenId?: string;
+      results?: LabResultItem[];
+      interpretation?: string;
+      notes?: string;
+      reason?: string;
+    }
+  ) => Promise<{ success: boolean; order?: LabTestOrder; error?: string }>;
+  updateClinicSettings: (updates: Partial<ClinicOperationalSettings>) => Promise<{ success: boolean; settings?: ClinicOperationalSettings; error?: string }>;
+  updateNotificationPreferences: (updates: Partial<NotificationPreferences>) => Promise<{ success: boolean; preferences?: NotificationPreferences; error?: string }>;
+  runScheduledRemindersNow: () => Promise<{ success: boolean; evaluatedCount?: number; dispatchedCount?: number; skippedCount?: number; error?: string }>;
 }
 
 const ClinicContext = createContext<ClinicContextType | undefined>(undefined);
@@ -254,11 +298,11 @@ export const GUEST_USER: User = {
   name: 'Guest User',
   email: '',
   role: 'patient',
-  avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&q=80&w=200',
+  avatar: '',
   department: 'Outpatient Services',
 };
 
-const CLINIC_CACHE_VERSION = 'v4.1.0-director-santos';
+const CLINIC_CACHE_VERSION = 'v5.0.0-smartclinic-v2-master';
 
 try {
   if (typeof window !== 'undefined') {
@@ -332,53 +376,46 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setIsBookAppointmentOpen(true);
   }, []);
 
-  // Global Language state (English / Tagalog)
-  const [language, setLanguageState] = useState<AppLanguage>(() => {
-    try {
-      const saved = localStorage.getItem('smart_clinic_language');
-      if (saved === 'en' || saved === 'fil') return saved;
-    } catch {}
-    return 'en';
-  });
+  // Global Language state locked to English ('en')
+  const [language, setLanguageState] = useState<AppLanguage>('en');
 
-  const setLanguage = (lang: AppLanguage) => {
-    setLanguageState(lang);
+  const setLanguage = (_lang: AppLanguage) => {
+    setLanguageState('en');
     try {
-      localStorage.setItem('smart_clinic_language', lang);
+      localStorage.setItem('smart_clinic_language', 'en');
     } catch {}
   };
 
-  const t = useMemo(() => getTranslation(language), [language]);
+  const t = useMemo(() => getTranslation('en'), []);
 
-  // Session Timeout (Auto Logout) implementation
-  // Exact user requirements:
-  // - Doctor: 3 minutes of inactivity (180 seconds)
-  // - Staff: 5 minutes of inactivity (300 seconds)
-  // - Patient: 10 minutes of inactivity (600 seconds)
-  // - Admin: 15 minutes of inactivity (900 seconds)
-  // - Show warning before logout and automatically redirect to login page when time is up.
-  // - Reset timer when user is active.
+  const [clinicSettings, setClinicSettings] = useState<ClinicOperationalSettings>({
+    id: 'default',
+    noShowGraceMinutes: DEFAULT_NO_SHOW_GRACE_MINUTES,
+    inactivityTimeoutSeconds: 600,
+    inactivityWarningSeconds: 60,
+    reminder24hEnabled: true,
+    reminder2hEnabled: false,
+    branches: ['Main Outpatient Clinic', 'Annex Satellite Clinic'],
+  });
+
+  const [activeClinicalSessionProtected, setActiveClinicalSessionProtected] = useState<boolean>(false);
+  const activeClinicalProtectedRef = React.useRef<boolean>(false);
+  activeClinicalProtectedRef.current = activeClinicalSessionProtected;
+
+  // Session Timeout (Auto Logout): Configurable 10-minute (600s) default across ALL roles
+  // with 1-minute (60s) warning, cross-tab sync, and active form/camera/teleconsult protection.
   const lastActivityRef = React.useRef<number>(Date.now());
   const [showSessionWarning, setShowSessionWarning] = useState<boolean>(false);
   const showSessionWarningRef = React.useRef<boolean>(false);
   showSessionWarningRef.current = showSessionWarning;
 
   const getTimeoutSeconds = useCallback(() => {
-    // Role-based true user-interaction inactivity policy:
-    // 1. Patient: 30 minutes (1800s) of inactivity
-    if (primaryRole === 'patient' || activeRole === 'patient') {
-      return 30 * 60;
-    }
-    // 2. System Administrator: 15 minutes (900s) of inactivity
-    if (activeRole === 'admin' || primaryRole === 'admin') {
-      return 15 * 60;
-    }
-    // 3. Clinic Staff (Doctors, Nurses, Receptionists, Pharmacists, Lab Techs): 15 minutes (900s) of inactivity
-    return 15 * 60;
-  }, [primaryRole, activeRole]);
+    const secs = Number(clinicSettings?.inactivityTimeoutSeconds || 600);
+    return Math.max(120, Math.min(3600, secs));
+  }, [clinicSettings?.inactivityTimeoutSeconds]);
 
-  const [sessionTimeoutTotal, setSessionTimeoutTotal] = useState<number>(() => 15 * 60);
-  const [sessionSecondsRemaining, setSessionSecondsRemaining] = useState<number>(() => 15 * 60);
+  const [sessionTimeoutTotal, setSessionTimeoutTotal] = useState<number>(() => 600);
+  const [sessionSecondsRemaining, setSessionSecondsRemaining] = useState<number>(() => 600);
   const lastServerHeartbeatRef = React.useRef<number>(0);
 
   const logoutRef = React.useRef<(redirectTab?: string) => void>(() => {});
@@ -396,7 +433,11 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   }, [authToken]);
 
   const resetSessionTimer = useCallback(() => {
-    lastActivityRef.current = Date.now();
+    const now = Date.now();
+    lastActivityRef.current = now;
+    try {
+      localStorage.setItem('smart_clinic_last_activity_ts', String(now));
+    } catch {}
     setShowSessionWarning(false);
     const totalSecs = getTimeoutSeconds();
     setSessionTimeoutTotal(totalSecs);
@@ -411,6 +452,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
 
     const totalSecs = getTimeoutSeconds();
+    const warningSecs = Math.max(30, Math.min(180, Number(clinicSettings?.inactivityWarningSeconds || 60)));
     setSessionTimeoutTotal(totalSecs);
     setSessionSecondsRemaining(totalSecs);
     lastActivityRef.current = Date.now();
@@ -418,8 +460,6 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     let lastLoggedActivity = Date.now();
     const handleUserActivity = () => {
-      // While the warning modal is shown, do NOT let background window events reset the timer or close the modal!
-      // The user must explicitly click "Stay Signed In" or "Log Out".
       if (showSessionWarningRef.current) {
         return;
       }
@@ -427,30 +467,62 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (now - lastLoggedActivity > 500) {
         lastLoggedActivity = now;
         lastActivityRef.current = now;
+        try {
+          localStorage.setItem('smart_clinic_last_activity_ts', String(now));
+        } catch {}
       }
-      // Renew server-side session inactivity clock at most every 45s of genuine user interaction
       if (now - lastServerHeartbeatRef.current > 45_000) {
         sendServerSessionHeartbeat();
       }
     };
 
-    // Only genuine user interactions count as activity (no background polling or timer ticks)
-    const events = ['pointerdown', 'mousedown', 'keydown', 'touchstart', 'wheel', 'click'];
+    const handleCrossTabStorage = (ev: StorageEvent) => {
+      if (ev.key === 'smart_clinic_last_activity_ts' && ev.newValue) {
+        const ts = Number(ev.newValue);
+        if (Number.isFinite(ts) && ts > lastActivityRef.current) {
+          lastActivityRef.current = ts;
+          setShowSessionWarning(false);
+        }
+      }
+    };
+
+    const events = ['pointerdown', 'mousedown', 'keydown', 'touchstart', 'wheel', 'click', 'input'];
     events.forEach((ev) => window.addEventListener(ev, handleUserActivity, { passive: true }));
+    window.addEventListener('storage', handleCrossTabStorage);
 
     const interval = setInterval(() => {
       const now = Date.now();
+      // Protect active form typing, consultation note authoring, QR camera scanning, or active Online Consultation
+      const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+      const isActivelyEditingField =
+        activeEl instanceof HTMLTextAreaElement ||
+        (activeEl instanceof HTMLInputElement &&
+          activeEl.type !== 'checkbox' &&
+          activeEl.type !== 'radio' &&
+          activeEl.value.trim().length > 0 &&
+          activeEl.closest('[role="dialog"], form') !== null);
+
+      if (activeClinicalProtectedRef.current || isActivelyEditingField) {
+        lastActivityRef.current = now;
+        setShowSessionWarning(false);
+        setSessionSecondsRemaining(getTimeoutSeconds());
+        if (now - lastServerHeartbeatRef.current > 45_000) {
+          sendServerSessionHeartbeat();
+        }
+        return;
+      }
+
       const timeoutSecs = getTimeoutSeconds();
       const elapsedSecs = Math.max(0, Math.floor((now - lastActivityRef.current) / 1000));
       const remainingSecs = Math.max(0, timeoutSecs - elapsedSecs);
 
+      setSessionTimeoutTotal(timeoutSecs);
       setSessionSecondsRemaining(remainingSecs);
 
       if (remainingSecs <= 0) {
         setShowSessionWarning(false);
         logoutRef.current('login');
-      } else if (remainingSecs <= 120) {
-        // Show warning 2 minutes (120s) before session expiration
+      } else if (remainingSecs <= warningSecs) {
         setShowSessionWarning(true);
       } else {
         setShowSessionWarning(false);
@@ -459,9 +531,10 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     return () => {
       events.forEach((ev) => window.removeEventListener(ev, handleUserActivity));
+      window.removeEventListener('storage', handleCrossTabStorage);
       clearInterval(interval);
     };
-  }, [isAuthenticated, getTimeoutSeconds, sendServerSessionHeartbeat]);
+  }, [isAuthenticated, getTimeoutSeconds, clinicSettings?.inactivityWarningSeconds, sendServerSessionHeartbeat]);
 
   const [patientAccounts, setPatientAccounts] = useState<PatientAccount[]>(() => {
     try {
@@ -563,6 +636,27 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     return saved ? JSON.parse(saved) : INITIAL_AUDIT_LOGS;
   });
 
+  const [inventoryTransactions, setInventoryTransactions] = useState<InventoryTransaction[]>(() => {
+    try {
+      const saved = localStorage.getItem('smart_clinic_inventory_tx');
+      return saved ? JSON.parse(saved) : INITIAL_INVENTORY_TRANSACTIONS;
+    } catch {
+      return INITIAL_INVENTORY_TRANSACTIONS;
+    }
+  });
+
+  const [restockRequests, setRestockRequests] = useState<RestockRequest[]>(() => {
+    try {
+      const saved = localStorage.getItem('smart_clinic_restock_requests');
+      return saved ? JSON.parse(saved) : INITIAL_RESTOCK_REQUESTS;
+    } catch {
+      return INITIAL_RESTOCK_REQUESTS;
+    }
+  });
+
+  const [notificationPreferences, setNotificationPreferences] = useState<NotificationPreferences | null>(null);
+  const [reminderLogs, setReminderLogs] = useState<ReminderDeliveryLog[]>([]);
+
   const [searchQuery, setSearchQuery] = useState<string>('');
 
   // Persist clinic data with strict Smart Clinic namespacing
@@ -573,6 +667,8 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   useEffect(() => { localStorage.setItem('smart_clinic_prescriptions', JSON.stringify(prescriptions)); }, [prescriptions]);
   useEffect(() => { localStorage.setItem('smart_clinic_lab_orders', JSON.stringify(labOrders)); }, [labOrders]);
   useEffect(() => { localStorage.setItem('smart_clinic_inventory', JSON.stringify(inventory)); }, [inventory]);
+  useEffect(() => { localStorage.setItem('smart_clinic_inventory_tx', JSON.stringify(inventoryTransactions)); }, [inventoryTransactions]);
+  useEffect(() => { localStorage.setItem('smart_clinic_restock_requests', JSON.stringify(restockRequests)); }, [restockRequests]);
   useEffect(() => { localStorage.setItem('smart_clinic_invoices', JSON.stringify(invoices)); }, [invoices]);
   useEffect(() => { localStorage.setItem('smart_clinic_hmo_partners', JSON.stringify(hmoPartners)); }, [hmoPartners]);
   useEffect(() => { localStorage.setItem('smart_clinic_notifications', JSON.stringify(notifications)); }, [notifications]);
@@ -582,11 +678,12 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const syncClinicFromBackend = useCallback(async () => {
     try {
       const token = authToken || localStorage.getItem('smart_clinic_token');
+      if (!token) return;
       const headers: Record<string, string> = {
         'x-user-role': activeRole,
         'x-background-poll': '1',
+        Authorization: `Bearer ${token}`,
       };
-      if (token) headers['Authorization'] = `Bearer ${token}`;
       if (linkedPatientId) headers['x-linked-patient-id'] = linkedPatientId;
 
       const res = await fetch(`${API_BASE_URL}/api/clinic/sync`, { headers });
@@ -656,6 +753,24 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         }
         if (Array.isArray(data.inventory) && data.inventory.length > 0) {
           setInventory(data.inventory);
+        }
+        if (Array.isArray(data.inventoryTransactions)) {
+          setInventoryTransactions(data.inventoryTransactions);
+        }
+        if (Array.isArray(data.restockRequests)) {
+          setRestockRequests(data.restockRequests);
+        }
+        if (data.clinicSettings && typeof data.clinicSettings === 'object') {
+          setClinicSettings((prev) => ({ ...prev, ...data.clinicSettings }));
+          if (typeof data.clinicSettings.noShowGraceMinutes === 'number') {
+            setNoShowGraceMinutesState(data.clinicSettings.noShowGraceMinutes);
+          }
+        }
+        if (data.notificationPreferences && typeof data.notificationPreferences === 'object') {
+          setNotificationPreferences(data.notificationPreferences);
+        }
+        if (Array.isArray(data.reminderLogs)) {
+          setReminderLogs(data.reminderLogs);
         }
         if (Array.isArray(data.invoices)) {
           setInvoices(data.invoices);
@@ -768,7 +883,13 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     } catch { /* ignore */ }
   }, [authReady, isAuthenticated, primaryRole, staffSubRole, linkedPatientId, currentUser, activeRole, authToken]);
 
-  const logAction = (action: string, resourceType: AuditLog['resourceType'], resourceId: string, description: string) => {
+  const logAction = (
+    action: string,
+    resourceType: AuditLog['resourceType'],
+    resourceId: string,
+    description: string,
+    explicitToken?: string
+  ) => {
     const newLog: AuditLog = {
       id: `aud-${Date.now()}`,
       timestamp: new Date().toISOString(),
@@ -785,16 +906,18 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     syncAuditLogToSupabase(newLog);
 
     try {
-      const token = authToken || localStorage.getItem('smart_clinic_token');
-      fetch(`${API_BASE_URL}/api/audit-logs`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-role': activeRole,
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify(newLog),
-      }).catch(() => {});
+      const token = explicitToken || authToken || localStorage.getItem('smart_clinic_token');
+      if (token) {
+        fetch(`${API_BASE_URL}/api/audit-logs`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(newLog),
+        }).catch(() => {});
+      }
     } catch {}
   };
 
@@ -901,9 +1024,14 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setIsAuthenticated(true);
     setLinkedPatientId(patientId);
     setSelectedPatientId(patientId);
-    if (token) setAuthToken(token);
+    if (token) {
+      setAuthToken(token);
+      try {
+        localStorage.setItem('smart_clinic_token', token);
+      } catch {}
+    }
     setActiveTab(pendingAction === 'book' ? 'home' : pendingAction === 'queue' ? 'queue' : 'dashboard');
-    logAction('AUTH_LOGIN', 'Security', accountId, `Patient session established: ${fullName}`);
+    logAction('AUTH_LOGIN', 'Security', accountId, `Patient session established: ${fullName}`, token);
   };
 
   const registerPatient = (input: {
@@ -1067,7 +1195,12 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
 
       const { token, user } = serverRes;
-      if (token) setAuthToken(token);
+      if (token) {
+        setAuthToken(token);
+        try {
+          localStorage.setItem('smart_clinic_token', token);
+        } catch {}
+      }
 
       // Route based on role
       if (role === 'patient') {
@@ -1103,15 +1236,15 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         setPrimaryRole('doctor');
         setStaffSubRole(null);
         setIsAuthenticated(true);
-        // Provider routes directly to Live Queue if requested, else Consultation Suite
-        setActiveTab(pendingAction === 'queue' ? 'queue' : 'consultations');
-        logAction('AUTH_LOGIN', 'Security', resolvedDoctor.id, `Doctor provider logged in: ${resolvedDoctor.name}`);
+        // Route doctors directly to their appointment-focused Doctor Dashboard unless queue explicitly requested
+        setActiveTab(pendingAction === 'queue' ? 'queue' : 'dashboard');
+        logAction('AUTH_LOGIN', 'Security', resolvedDoctor.id, `Doctor provider logged in: ${resolvedDoctor.name}`, token);
         return { success: true };
       }
 
       if (role === 'staff') {
         const targetSubRole = (subRole || 'nurse') as UserRole;
-        const staffUser = users.find((u) => u.role === subRole || u.id === user.id || u.email?.toLowerCase() === user.email?.toLowerCase()) || user;
+        const staffUser = users.find((u) => u.id === user.id || u.email?.toLowerCase() === user.email?.toLowerCase()) || user;
         const resolvedStaff: User = {
           ...staffUser,
           role: targetSubRole,
@@ -1123,20 +1256,17 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         setStaffSubRole(subRole || 'nurse');
         setIsAuthenticated(true);
 
-        // Dynamic routing to appropriate staff workbench or requested queue
         if (pendingAction === 'queue') setActiveTab('queue');
-        else if (subRole === 'nurse') setActiveTab('queue');
         else if (subRole === 'pharmacist') setActiveTab('inventory');
-        else if (subRole === 'receptionist') setActiveTab('appointments');
         else if (subRole === 'lab_technician') setActiveTab('laboratory');
         else setActiveTab('dashboard');
 
-        logAction('AUTH_LOGIN', 'Security', resolvedStaff.id, `Staff logged in: ${subRole}`);
+        logAction('AUTH_LOGIN', 'Security', resolvedStaff.id, `Staff logged in: ${subRole}`, token);
         return { success: true };
       }
 
       if (role === 'admin') {
-        const adminUser = users.find((u) => u.role === 'admin' || u.id === user.id || u.email?.toLowerCase() === user.email?.toLowerCase()) || user;
+        const adminUser = users.find((u) => u.id === user.id || u.email?.toLowerCase() === user.email?.toLowerCase()) || user;
         const resolvedAdmin: User = {
           ...adminUser,
           role: 'admin',
@@ -1148,103 +1278,13 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         setStaffSubRole(null);
         setIsAuthenticated(true);
         setActiveTab(pendingAction === 'queue' ? 'queue' : 'dashboard');
-        logAction('AUTH_LOGIN', 'Security', resolvedAdmin.id, 'Administrator 2FA verified and logged in.');
+        logAction('AUTH_LOGIN', 'Security', resolvedAdmin.id, 'Administrator 2FA verified and logged in.', token);
         return { success: true };
       }
 
       return { success: false, error: 'Unknown role.' };
     } catch (netErr) {
       console.warn('[Smart Clinic Auth] Network error connecting to auth server:', netErr);
-      
-      // If network fails (e.g. offline device / airplane mode), allow cached or valid demo fallback
-      if (role === 'patient') {
-        const cleanEmail = (credentials.email || '').trim().toLowerCase();
-        const cleanPhone = (credentials.phone || '').replace(/\D/g, '');
-
-        if (credentials.isRegister) {
-          return registerPatient({
-            fullName: credentials.fullName || cleanEmail.split('@')[0] || 'New Patient',
-            email: cleanEmail,
-            phone: cleanPhone,
-            password: credentials.password,
-            dob: credentials.dob,
-            age: credentials.age,
-            gender: credentials.gender,
-            bloodType: credentials.bloodType,
-            address: credentials.address,
-            emergencyContactName: credentials.emergencyContactName,
-            emergencyContactRelation: credentials.emergencyContactRelation,
-            emergencyContactPhone: credentials.emergencyContactPhone,
-            allergies: credentials.allergies,
-            chronicConditions: credentials.chronicConditions,
-          });
-        }
-
-        const matched = patientAccounts.find(
-          (a) =>
-            (cleanEmail && a.email?.toLowerCase() === cleanEmail) ||
-            (cleanPhone && a.phone === cleanPhone)
-        );
-
-        if (matched && matched.passwordHash === simpleHash(credentials.password || '')) {
-          finishPatientSession(matched.id, matched.fullName, matched.email || '', matched.patientId);
-          return { success: true };
-        }
-      }
-
-      // Fallback for demo credentials in offline/sandbox mode
-      if (role === 'doctor' && (credentials.password === 'doctor123' || !credentials.password)) {
-        const doc = users.find((u) => u.role === 'doctor') || users[0];
-        setCurrentUser(doc);
-        setActiveRole('doctor');
-        setPrimaryRole('doctor');
-        setStaffSubRole(null);
-        setIsAuthenticated(true);
-        setActiveTab(pendingAction === 'queue' ? 'queue' : 'consultations');
-        return { success: true };
-      }
-
-      if (role === 'staff') {
-        const staffSub = subRole || 'nurse';
-        const st = users.find((u) => u.role === staffSub) || {
-          id: `usr-${staffSub}`,
-          name: `${staffSub.toUpperCase()} Practitioner`,
-          email: `${staffSub}@smartclinic.ph`,
-          role: staffSub as UserRole,
-        };
-        setCurrentUser(st);
-        setActiveRole(staffSub as UserRole);
-        setPrimaryRole('staff');
-        setStaffSubRole(staffSub);
-        setIsAuthenticated(true);
-        if (pendingAction === 'queue') setActiveTab('queue');
-        else if (staffSub === 'nurse') setActiveTab('queue');
-        else if (staffSub === 'pharmacist') setActiveTab('inventory');
-        else if (staffSub === 'receptionist') setActiveTab('appointments');
-        else if (staffSub === 'lab_technician') setActiveTab('laboratory');
-        else setActiveTab('dashboard');
-        return { success: true };
-      }
-
-      if (role === 'admin' && (credentials.password === 'SmartClinic@Admin2026' || !credentials.password)) {
-        const adm = users.find((u) => u.role === 'admin' && u.email === 'smartclinicrealacc@gmail.com') || users.find((u) => u.role === 'admin') || {
-          id: 'usr-admin',
-          name: 'Director Maria Lourdes Santos, MD',
-          email: 'smartclinicrealacc@gmail.com',
-          role: 'admin' as UserRole,
-          department: 'Executive Management',
-          specialty: 'Healthcare Administration & Internal Medicine',
-          licenseNumber: 'PRC-0081294',
-        };
-        setCurrentUser(adm);
-        setActiveRole('admin');
-        setPrimaryRole('admin');
-        setStaffSubRole(null);
-        setIsAuthenticated(true);
-        setActiveTab(pendingAction === 'queue' ? 'queue' : 'dashboard');
-        return { success: true };
-      }
-
       return {
         success: false,
         error:
@@ -1256,10 +1296,14 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const logout = useCallback((redirectTab: string = 'login') => {
     const existingToken = authToken || (typeof window !== 'undefined' ? localStorage.getItem('smart_clinic_token') : null);
     if (existingToken) {
-      disablePatientPushNotifications(existingToken).catch(() => {});
+      // Preserve Web Push subscriptions across sign-out so patients continue receiving opt-in appointment reminders
       fetch(`${API_BASE_URL}/api/auth/logout`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${existingToken}` },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${existingToken}`,
+        },
+        body: JSON.stringify({ revokePush: false }),
       }).catch(() => {});
     }
     setIsAuthenticated(false);
@@ -1271,12 +1315,12 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setCurrentUser(GUEST_USER);
     setAuthToken(null);
     setShowSessionWarning(false);
+    setActiveClinicalSessionProtected(false);
     setSelectedPatientId(null);
     setTriageDraftForBooking(null);
-    setSessionSecondsRemaining(15 * 60);
+    setSessionSecondsRemaining(clinicSettings?.inactivityTimeoutSeconds || 600);
     lastActivityRef.current = Date.now();
     try {
-      // Clear protected auth & notification state while preserving non-sensitive smart_clinic_safe_draft_* form drafts
       localStorage.removeItem('smart_clinic_auth_session');
       localStorage.removeItem('smart_clinic_token');
       localStorage.removeItem('smart_clinic_notifications');
@@ -1287,7 +1331,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setNotifications([]);
     setIsNavigating(false);
     setActiveTabState(redirectTab);
-  }, [authToken]);
+  }, [authToken, clinicSettings?.inactivityTimeoutSeconds]);
 
   useEffect(() => {
     logoutRef.current = logout;
@@ -1318,17 +1362,16 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const isPatientScope = isAuthenticated && (primaryRole === 'patient' || activeRole === 'patient');
 
-  // Identify current authenticated patient record
+  // Strictly identify current authenticated patient record via verified linkedPatientId / authUserId (NEVER email or patientName)
   const currentPatientRecord = useMemo(() => {
     if (!isAuthenticated || !isPatientScope) return null;
     return (
-      patients.find((p) => p.id === linkedPatientId) ||
-      patients.find((p) => currentUser.email && p.email?.toLowerCase() === currentUser.email?.toLowerCase()) ||
+      patients.find((p) => linkedPatientId && p.id === linkedPatientId) ||
+      patients.find((p) => currentUser.id && (p.authUserId === currentUser.id || p.id === currentUser.id)) ||
       null
     );
-  }, [isAuthenticated, isPatientScope, linkedPatientId, patients, currentUser.email]);
+  }, [isAuthenticated, isPatientScope, linkedPatientId, patients, currentUser.id]);
 
-  // When patient is logged in, isolated arrays only contain their OWN records
   const isolatedPatients = useMemo(() => {
     if (!isAuthenticated) return [];
     if (isPatientScope) {
@@ -1342,7 +1385,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (isPatientScope) {
       if (!currentPatientRecord) return [];
       return appointments.filter(
-        (a) => a.patientId !== 'REDACTED' && (a.patientId === currentPatientRecord.id || a.patientName === currentPatientRecord.fullName)
+        (a) => a.patientId !== 'REDACTED' && a.patientId === currentPatientRecord.id
       );
     }
     return appointments;
@@ -1352,9 +1395,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (!isAuthenticated) return [];
     if (isPatientScope) {
       if (!currentPatientRecord) return [];
-      return consultations.filter(
-        (c) => c.patientId === currentPatientRecord.id || c.patientName === currentPatientRecord.fullName
-      );
+      return consultations.filter((c) => c.patientId === currentPatientRecord.id);
     }
     return consultations;
   }, [isAuthenticated, isPatientScope, currentPatientRecord, consultations]);
@@ -1363,9 +1404,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (!isAuthenticated) return [];
     if (isPatientScope) {
       if (!currentPatientRecord) return [];
-      return prescriptions.filter(
-        (p) => p.patientId === currentPatientRecord.id || p.patientName === currentPatientRecord.fullName
-      );
+      return prescriptions.filter((p) => p.patientId === currentPatientRecord.id);
     }
     return prescriptions;
   }, [isAuthenticated, isPatientScope, currentPatientRecord, prescriptions]);
@@ -1374,9 +1413,18 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (!isAuthenticated) return [];
     if (isPatientScope) {
       if (!currentPatientRecord) return [];
-      return labOrders.filter(
-        (l) => l.patientId === currentPatientRecord.id || l.patientName === currentPatientRecord.fullName
-      );
+      return labOrders
+        .filter((l) => l.patientId === currentPatientRecord.id)
+        .map((l) => {
+          const isReleased = Boolean(l.isFinalVerified) || l.status === 'Released' || l.status === 'Completed' || l.status === 'Reviewed';
+          if (isReleased) return l;
+          return {
+            ...l,
+            results: undefined,
+            interpretation: undefined,
+            aiSummary: undefined,
+          };
+        });
     }
     return labOrders;
   }, [isAuthenticated, isPatientScope, currentPatientRecord, labOrders]);
@@ -1385,11 +1433,8 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (!isAuthenticated) return [];
     if (isPatientScope) {
       if (!currentPatientRecord) return [];
-      return invoices.filter(
-        (i) => i.patientId === currentPatientRecord.id || i.patientName === currentPatientRecord.fullName
-      );
+      return invoices.filter((i) => i.patientId === currentPatientRecord.id);
     }
-    // Strict RBAC: Only Admin, Receptionist, or staff with explicit billing permission can access clinic-wide invoices
     if (activeRole !== 'admin') {
       const perms = currentUser?.permissions || (currentUser?.role ? DEFAULT_ROLE_PERMISSIONS[currentUser.role] : null);
       const canAccessBilling = activeRole === 'receptionist' || Boolean(perms?.billing);
@@ -1556,21 +1601,42 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (primaryRole === 'patient' && linkedPatientId && aptData.patientId !== linkedPatientId) {
       aptData = { ...aptData, patientId: linkedPatientId };
     }
-    const queueChar = aptData.department.startsWith('Cardio') ? 'B' : 'A';
+    const isWalkIn = Boolean(aptData.isWalkIn) || aptData.type === 'Walk-in';
+    const walkInCount = appointments.filter((a) => a.isWalkIn || a.type === 'Walk-in').length + 1;
+    const bookingRef = aptData.bookingReference || (!isWalkIn ? `BK-${new Date().getFullYear()}-${String(100000 + appointments.length + 1)}` : undefined);
     const newApt: Appointment = {
       ...aptData,
       id: `apt-${Date.now()}`,
-      queueNumber: `${queueChar}-${100 + appointments.length + 1}`,
+      status: isWalkIn ? (aptData.status || 'Checked In') : 'Confirmed',
+      isWalkIn,
+      queueNumber: isWalkIn ? (aptData.queueNumber || `W-${String(walkInCount).padStart(3, '0')}`) : undefined,
+      bookingReference: bookingRef,
+      consultationMode: aptData.consultationMode || (aptData.type === 'Online Consultation' || aptData.type === 'Telehealth' ? 'Online Consultation' : 'In-Person'),
       createdAt: new Date().toISOString(),
     };
     setAppointments((prev) => [newApt, ...prev]);
-    logAction('APPOINTMENT_BOOKED', 'Appointment', newApt.id, `Booked appointment for ${newApt.patientName}`);
+    logAction('APPOINTMENT_BOOKED', 'Appointment', newApt.id, `Booked appointment for ${newApt.patientName} (${newApt.bookingReference || newApt.queueNumber || newApt.id})`);
     syncAppointmentToSupabase(newApt);
 
-    syncToBackend('/api/appointments', {
-      method: 'POST',
-      body: JSON.stringify(newApt),
-    }, 'Create appointment');
+    try {
+      const token = authToken || localStorage.getItem('smart_clinic_token');
+      fetch(`${API_BASE_URL}/api/appointments`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-role': activeRole,
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(newApt),
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((savedApt) => {
+          if (savedApt && savedApt.id) {
+            setAppointments((prev) => prev.map((a) => (a.id === newApt.id || a.id === savedApt.id ? { ...a, ...savedApt } : a)));
+          }
+        })
+        .catch(() => {});
+    } catch {}
 
     if (typeof window !== 'undefined' && window.BroadcastChannel) {
       try {
@@ -1583,21 +1649,65 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     return newApt;
   };
 
+  const createAppointmentVerified = useCallback(
+    async (aptData: Omit<Appointment, 'id' | 'createdAt'>) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const payload =
+          primaryRole === 'patient' && linkedPatientId && aptData.patientId !== linkedPatientId
+            ? { ...aptData, patientId: linkedPatientId }
+            : aptData;
+        const res = await fetch(`${API_BASE_URL}/api/appointments`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          return { success: false, error: data.error || 'Failed to schedule appointment.' };
+        }
+        const savedApt: Appointment = data;
+        setAppointments((prev) => {
+          const exists = prev.some((a) => a.id === savedApt.id);
+          return exists ? prev.map((a) => (a.id === savedApt.id ? savedApt : a)) : [savedApt, ...prev];
+        });
+        syncAppointmentToSupabase(savedApt);
+        return { success: true, appointment: savedApt, qrPayload: data.qrPayload };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error while booking appointment.' };
+      }
+    },
+    [authToken, activeRole, primaryRole, linkedPatientId]
+  );
+
   const [noShowGraceMinutes, setNoShowGraceMinutesState] = useState<number>(() => {
     try {
-      const saved = Number(localStorage.getItem('smart_clinic_noshow_grace_mins') || '20');
-      return saved >= 15 && saved <= 30 ? saved : 20;
+      const saved = Number(localStorage.getItem('smart_clinic_noshow_grace_mins') || String(DEFAULT_NO_SHOW_GRACE_MINUTES));
+      return saved >= 5 && saved <= 120 ? saved : DEFAULT_NO_SHOW_GRACE_MINUTES;
     } catch {
-      return 20;
+      return DEFAULT_NO_SHOW_GRACE_MINUTES;
     }
   });
   const setNoShowGraceMinutes = useCallback((mins: number) => {
-    const clamped = Math.max(15, Math.min(30, Math.round(mins)));
+    const clamped = Math.max(5, Math.min(120, Math.round(mins)));
     setNoShowGraceMinutesState(clamped);
+    setClinicSettings((prev) => ({ ...prev, noShowGraceMinutes: clamped }));
     try {
       localStorage.setItem('smart_clinic_noshow_grace_mins', String(clamped));
+      const token = authToken || localStorage.getItem('smart_clinic_token');
+      if (token) {
+        fetch(`${API_BASE_URL}/api/settings/clinic`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ noShowGraceMinutes: clamped }),
+        }).catch(() => {});
+      }
     } catch {}
-  }, []);
+  }, [authToken]);
 
   const [wsConnected, setWsConnected] = useState<boolean>(false);
 
@@ -1869,18 +1979,23 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const checkInPatient = (appointmentId: string, room?: string) => {
     const apt = appointments.find((a) => a.id === appointmentId);
     if (!apt) return;
-    const defaultRoom = room || apt.room || 'Waiting Room B';
-    const queueNum = apt.queueNumber || `Q-${100 + appointments.length + 1}`;
+    if (apt.status === 'Checked In' || apt.status === 'In Consultation' || apt.status === 'Completed') {
+      return;
+    }
+    const isWalkIn = Boolean(apt.isWalkIn) || apt.type === 'Walk-in';
+    const defaultRoom = room || apt.room || 'Outpatient Waiting Area';
+    const walkInQueueNum = isWalkIn ? (apt.queueNumber || `W-${String(appointments.filter((x) => x.isWalkIn).length + 1).padStart(3, '0')}`) : undefined;
+    const nowIso = new Date().toISOString();
     const checkedInApt: Appointment = {
       ...apt,
       status: 'Checked In',
       room: defaultRoom,
-      queueNumber: apt.queueNumber || queueNum,
+      checkInAt: apt.checkInAt || nowIso,
+      checkedInBy: currentUser.name,
+      ...(isWalkIn ? { queueNumber: walkInQueueNum } : {}),
     };
 
-    setAppointments((prev) =>
-      prev.map((a) => (a.id === appointmentId ? checkedInApt : a))
-    );
+    setAppointments((prev) => prev.map((a) => (a.id === appointmentId ? checkedInApt : a)));
 
     try {
       const saved = localStorage.getItem('smart_clinic_appointments');
@@ -1895,10 +2010,19 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     syncToBackend(`/api/appointments/${appointmentId}/status`, {
       method: 'PATCH',
-      body: JSON.stringify({ status: 'Checked In', room: defaultRoom, queueNumber: queueNum }),
+      body: JSON.stringify({
+        status: 'Checked In',
+        room: defaultRoom,
+        ...(isWalkIn ? { queueNumber: walkInQueueNum } : {}),
+      }),
     }, 'Check in patient');
 
-    logAction('PATIENT_CHECKED_IN', 'Appointment', appointmentId, `Patient checked in to ${defaultRoom} (Ticket: ${queueNum})`);
+    logAction(
+      'PATIENT_CHECKED_IN',
+      'Appointment',
+      appointmentId,
+      `Patient checked in to ${defaultRoom} (${apt.bookingReference || walkInQueueNum || appointmentId})`
+    );
     addNotification({
       userId: apt.patientId,
       recipientId: apt.patientId,
@@ -1906,7 +2030,9 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       targetRole: 'patient',
       recipientRole: 'patient',
       title: 'Checked In to Outpatient Clinic',
-      message: `You are checked in with ticket #${queueNum}. Please wait in ${defaultRoom}.`,
+      message: isWalkIn
+        ? `Walk-in visit checked in (${walkInQueueNum}). Please wait in ${defaultRoom}.`
+        : `Appointment ${apt.bookingReference || ''} checked in. Please wait in ${defaultRoom}.`,
       category: 'appointment',
       priority: 'normal',
       relatedResourceId: appointmentId,
@@ -1919,18 +2045,13 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         doctorId: apt.doctorId,
         targetRole: 'provider',
         recipientRole: 'doctor',
-        title: 'Patient Checked In: Waiting in Lobby',
-        message: `${apt.patientName} (${apt.patientMrn}) checked in with ticket #${queueNum}. Seated in ${defaultRoom}.`,
+        title: 'Patient Checked In',
+        message: `${apt.patientName} (${apt.patientMrn}) arrived and checked in at ${defaultRoom}.`,
         category: 'triage',
         priority: 'normal',
         relatedResourceId: appointmentId,
         relatedResourceType: 'appointment',
       });
-    }
-    if (typeof window !== 'undefined' && window.BroadcastChannel) {
-      const channel = new BroadcastChannel('smart_clinic_notifications_broadcast');
-      channel.postMessage({ type: 'UPDATE_APPOINTMENT_STATUS', id: appointmentId, status: 'Checked In', room: defaultRoom });
-      channel.close();
     }
   };
 
@@ -1941,30 +2062,14 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       cancelAppointment(appointmentId, 'Cancelled from queue');
       return;
     }
-    const targetRoom = room || apt.room || (nextStatus === 'In Consultation' ? 'Room 302 (Consultation Suite)' : 'Waiting Room B');
+    const isWalkIn = Boolean(apt.isWalkIn) || apt.type === 'Walk-in';
+    if (nextStatus === 'Called' && !isWalkIn) {
+      return;
+    }
+    const targetRoom = room || apt.room || (nextStatus === 'In Consultation' ? 'Consultation Room 1' : 'Outpatient Waiting Area');
 
     updateAppointmentStatus(appointmentId, nextStatus, targetRoom);
-    logAction('QUEUE_ADVANCED', 'Appointment', appointmentId, `Queue status advanced to ${nextStatus} in ${targetRoom}`);
-
-    if (nextStatus === 'In Consultation') {
-      // Mark checked-in alerts as read
-      setNotifications((prev) =>
-        prev.map((n) => (n.relatedResourceId === appointmentId ? { ...n, read: true } : n))
-      );
-      addNotification({
-        userId: apt.patientId,
-        recipientId: apt.patientId,
-        patientId: apt.patientId,
-        targetRole: 'patient',
-        recipientRole: 'patient',
-        title: 'Now Serving: Proceed to Consultation Room',
-        message: `Ticket #${apt.queueNumber || 'Q-10'}. Please proceed to ${targetRoom} for your consultation with ${apt.doctorName}.`,
-        category: 'appointment',
-        priority: 'high',
-        relatedResourceId: appointmentId,
-        relatedResourceType: 'appointment',
-      });
-    }
+    logAction('QUEUE_ADVANCED', 'Appointment', appointmentId, `Visit status advanced to ${nextStatus} in ${targetRoom}`);
   };
 
   const rescheduleAppointment = (id: string, requestedDate: string, newTime: string): RescheduleComparisonResult => {
@@ -1980,7 +2085,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       prev.map((a) => {
         if (a.id === id) {
           result = applyReschedulingRule(requestedDate, a.date);
-          return { ...a, date: result.finalDate, time: newTime, status: 'Scheduled' };
+          return { ...a, date: result.finalDate, time: newTime, status: 'Confirmed' };
         }
         return a;
       })
@@ -1997,7 +2102,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       body: JSON.stringify({
         date: result.finalDate,
         time: newTime,
-        status: 'Scheduled',
+        status: 'Confirmed',
         originalDate: result.originalAppointmentDate,
         requestedDate: result.requestedDate,
         wasSameDay: result.wasSameDay,
@@ -2022,14 +2127,24 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     return newCons;
   };
 
+  // Doctor creates Active prescription WITHOUT deducting inventory stock (stock is deducted ONLY on Pharmacist dispensing)
   const addPrescription = (rxData: Omit<Prescription, 'id' | 'prescriptionNumber'>) => {
+    const normalizedItems = (rxData.items || []).map((it, idx) => ({
+      ...it,
+      id: it.id || `rxi-${Date.now()}-${idx}`,
+      dispensed: false,
+      dispensedQuantity: 0,
+      remainingQuantity: Number(it.quantity || 0),
+    }));
     const newRx: Prescription = {
       ...rxData,
       id: `rx-${Date.now()}`,
       prescriptionNumber: `RX-2026-${String(9000 + prescriptions.length + 1)}`,
+      status: 'Active',
+      items: normalizedItems,
     };
     setPrescriptions((prev) => [newRx, ...prev]);
-    logAction('PRESCRIPTION_CREATED', 'Prescription', newRx.id, `Created e-Prescription ${newRx.prescriptionNumber} for ${newRx.patientName}`);
+    logAction('PRESCRIPTION_CREATED', 'Prescription', newRx.id, `Created e-Prescription ${newRx.prescriptionNumber} for ${newRx.patientName} (Pending Pharmacist Dispensing)`);
     syncPrescriptionToSupabase(newRx);
 
     syncToBackend('/api/prescriptions', {
@@ -2040,48 +2155,340 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     return newRx;
   };
 
-  // Dispense medication linked with automated stock deduction & audited adjustment
+  const dispensePrescription = useCallback(
+    async (
+      prescriptionId: string,
+      items?: { itemId: string; quantityToDispense: number }[],
+      notes?: string
+    ) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const res = await fetch(`${API_BASE_URL}/api/prescriptions/${prescriptionId}/dispense`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ items, notes }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) {
+          return { success: false, error: data.error || 'Failed to dispense prescription.' };
+        }
+        if (data.prescription) {
+          setPrescriptions((prev) => prev.map((r) => (r.id === prescriptionId ? data.prescription : r)));
+        }
+        if (Array.isArray(data.inventory)) {
+          setInventory(data.inventory);
+        } else {
+          await syncClinicFromBackend();
+        }
+        if (Array.isArray(data.transactions) && data.transactions.length > 0) {
+          setInventoryTransactions((prev) => [...data.transactions, ...prev]);
+        }
+        return {
+          success: true,
+          prescription: data.prescription,
+          transactions: data.transactions,
+          lowStockAlerts: data.lowStockAlerts,
+        };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error dispensing medication.' };
+      }
+    },
+    [authToken, activeRole, syncClinicFromBackend]
+  );
+
+  // Backwards-compatible wrapper routing single-item dispense through atomic endpoint
   const dispenseMedication = (prescriptionId: string, itemId: string) => {
     const rx = prescriptions.find((r) => r.id === prescriptionId);
     const item = rx?.items.find((i) => i.id === itemId);
-
-    if (item && !item.dispensed) {
-      // Find matching inventory item by name or generic name
-      const match = inventory.find(
-        (inv) =>
-          inv.name.toLowerCase().includes(item.medicationName.toLowerCase()) ||
-          item.medicationName.toLowerCase().includes(inv.name.toLowerCase()) ||
-          inv.genericName.toLowerCase().includes(item.genericName.toLowerCase())
-      );
-      if (match) {
-        adjustStock(match.id, -item.quantity, `Dispensed for e-Prescription ${rx?.prescriptionNumber}`);
-      }
-      logAction('DISPENSE_MEDICATION', 'Prescription', rx?.id || prescriptionId, `Dispensed ${item.quantity} units of ${item.medicationName}`);
-    }
-
-    let updatedItems: any[] = [];
-    let updatedStatus: Prescription['status'] = 'Active';
-
-    setPrescriptions((prev) =>
-      prev.map((r) => {
-        if (r.id !== prescriptionId) return r;
-        const items = r.items.map((it) => (it.id === itemId ? { ...it, dispensed: true } : it));
-        const status = items.every((it) => it.dispensed) ? 'Dispensed' : 'Partially Dispensed';
-        updatedItems = items;
-        updatedStatus = status;
-        return {
-          ...r,
-          items,
-          status,
-        };
-      })
-    );
-
-    syncToBackend(`/api/prescriptions/${prescriptionId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ items: updatedItems, status: updatedStatus }),
-    }, 'Dispense medication');
+    const remaining = item ? (item.remainingQuantity ?? (item.dispensed ? 0 : item.quantity)) : 0;
+    if (!item || remaining <= 0) return;
+    void dispensePrescription(prescriptionId, [{ itemId, quantityToDispense: remaining }]);
   };
+
+  const verifyAppointmentQr = useCallback(
+    async (qrPayload: string, confirmCheckIn: boolean = false, room?: string) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const res = await fetch(`${API_BASE_URL}/api/appointments/verify-qr`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ qrPayload, confirmCheckIn, room }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          return {
+            success: false,
+            alreadyCheckedIn: res.status === 409,
+            appointment: data.appointment,
+            patientSummary: data.patientSummary,
+            error: data.error || 'Appointment QR verification failed.',
+          };
+        }
+        if (data.appointment) {
+          setAppointments((prev) =>
+            prev.map((a) => (a.id === data.appointment.id ? { ...a, ...data.appointment } : a))
+          );
+        }
+        return {
+          success: true,
+          checkedIn: Boolean(data.checkedIn),
+          appointment: data.appointment,
+          patientSummary: data.patientSummary,
+        };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error verifying QR.' };
+      }
+    },
+    [authToken, activeRole]
+  );
+
+  const recordPatientVitals = useCallback(
+    async (
+      patientId: string,
+      vitalsInput: Partial<Vitals> & { appointmentId?: string; isPatientReported?: boolean; source?: Vitals['source'] }
+    ) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const res = await fetch(`${API_BASE_URL}/api/patients/${patientId}/vitals`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify(vitalsInput),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) {
+          return { success: false, error: data.error || 'Failed to save vital signs.' };
+        }
+        if (data.vitals) {
+          setPatients((prev) =>
+            prev.map((p) => (p.id === patientId ? { ...p, vitalsHistory: [data.vitals, ...(p.vitalsHistory || [])] } : p))
+          );
+        }
+        if (vitalsInput.appointmentId && activeRole === 'nurse') {
+          setAppointments((prev) =>
+            prev.map((a) => (a.id === vitalsInput.appointmentId ? { ...a, nurseVitalsRecorded: true } : a))
+          );
+        }
+        return { success: true, vitals: data.vitals };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error saving vital signs.' };
+      }
+    },
+    [authToken, activeRole]
+  );
+
+  const updateReorderThreshold = useCallback(
+    async (itemId: string, reorderLevel: number) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const res = await fetch(`${API_BASE_URL}/api/inventory/${itemId}/threshold`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ reorderLevel }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) return { success: false, error: data.error || 'Failed to update threshold.' };
+        setInventory((prev) => prev.map((it) => (it.id === itemId ? { ...it, reorderLevel } : it)));
+        return { success: true };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error updating threshold.' };
+      }
+    },
+    [authToken, activeRole]
+  );
+
+  const createRestockRequest = useCallback(
+    async (input: { inventoryItemId: string; requestedQuantity: number; supplier?: string; notes?: string }) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const res = await fetch(`${API_BASE_URL}/api/inventory/restock-requests`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify(input),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) return { success: false, error: data.error || 'Failed to create restock request.' };
+        if (data.request) {
+          setRestockRequests((prev) => [data.request, ...prev]);
+        }
+        return { success: true, request: data.request };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error creating restock request.' };
+      }
+    },
+    [authToken, activeRole]
+  );
+
+  const updateRestockRequest = useCallback(
+    async (
+      requestId: string,
+      input: { action: 'approve' | 'receive' | 'cancel'; receivedQuantity?: number; batchNumber?: string; expirationDate?: string }
+    ) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const res = await fetch(`${API_BASE_URL}/api/inventory/restock-requests/${requestId}`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify(input),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) return { success: false, error: data.error || 'Failed to update restock request.' };
+        if (data.request) {
+          setRestockRequests((prev) => prev.map((r) => (r.id === requestId ? data.request : r)));
+        }
+        if (data.inventoryItem) {
+          setInventory((prev) => prev.map((it) => (it.id === data.inventoryItem.id ? data.inventoryItem : it)));
+        }
+        if (data.transaction) {
+          setInventoryTransactions((prev) => [data.transaction, ...prev]);
+        }
+        return { success: true };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error updating restock request.' };
+      }
+    },
+    [authToken, activeRole]
+  );
+
+  const advanceLabWorkflow = useCallback(
+    async (
+      orderId: string,
+      payload: {
+        action: 'verify-patient' | 'collect-sample' | 'start-processing' | 'encode-results' | 'verify-and-release' | 'amend-result' | 'doctor-acknowledge';
+        specimenType?: string;
+        specimenId?: string;
+        results?: LabResultItem[];
+        interpretation?: string;
+        notes?: string;
+        reason?: string;
+      }
+    ) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const res = await fetch(`${API_BASE_URL}/api/lab-orders/${orderId}/workflow`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) return { success: false, error: data.error || 'Failed to advance laboratory workflow.' };
+        if (data.order) {
+          setLabOrders((prev) => prev.map((o) => (o.id === orderId ? data.order : o)));
+        }
+        return { success: true, order: data.order };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error updating laboratory order.' };
+      }
+    },
+    [authToken, activeRole]
+  );
+
+  const updateClinicSettings = useCallback(
+    async (updates: Partial<ClinicOperationalSettings>) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const res = await fetch(`${API_BASE_URL}/api/settings/clinic`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify(updates),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) return { success: false, error: data.error || 'Failed to save operational settings.' };
+        if (data.settings) {
+          setClinicSettings((prev) => ({ ...prev, ...data.settings }));
+          if (typeof data.settings.noShowGraceMinutes === 'number') {
+            setNoShowGraceMinutesState(data.settings.noShowGraceMinutes);
+          }
+        }
+        return { success: true, settings: data.settings };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error saving operational settings.' };
+      }
+    },
+    [authToken, activeRole]
+  );
+
+  const updateNotificationPreferences = useCallback(
+    async (updates: Partial<NotificationPreferences>) => {
+      try {
+        const token = authToken || localStorage.getItem('smart_clinic_token');
+        const res = await fetch(`${API_BASE_URL}/api/notifications/preferences`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-role': activeRole,
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify(updates),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) return { success: false, error: data.error || 'Failed to save notification preferences.' };
+        if (data.preferences) {
+          setNotificationPreferences(data.preferences);
+        }
+        return { success: true, preferences: data.preferences };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Network error saving notification preferences.' };
+      }
+    },
+    [authToken, activeRole]
+  );
+
+  const runScheduledRemindersNow = useCallback(async () => {
+    try {
+      const token = authToken || localStorage.getItem('smart_clinic_token');
+      const res = await fetch(`${API_BASE_URL}/api/cron/reminders`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-role': activeRole,
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) return { success: false, error: data.error || 'Failed to evaluate reminders.' };
+      await syncClinicFromBackend();
+      return {
+        success: true,
+        evaluatedCount: data.evaluatedCount,
+        dispatchedCount: data.dispatchedCount,
+        skippedCount: data.skippedCount,
+      };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Network error triggering reminder evaluation.' };
+    }
+  }, [authToken, activeRole, syncClinicFromBackend]);
 
   const addLabOrder = (orderData: Omit<LabTestOrder, 'id' | 'orderNumber' | 'requestedAt'>) => {
     const newOrder: LabTestOrder = {
@@ -2089,6 +2496,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       id: `lab-${Date.now()}`,
       orderNumber: `LAB-2026-${String(1000 + labOrders.length + 1)}`,
       requestedAt: new Date().toISOString(),
+      isFinalVerified: false,
     };
     setLabOrders((prev) => [newOrder, ...prev]);
     logAction('LAB_ORDER_CREATED', 'Laboratory', newOrder.id, `Ordered ${newOrder.testName} for ${newOrder.patientName}`);
@@ -2105,7 +2513,11 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const updateLabStatus = (orderId: string, status: LabTestOrder['status']) => {
     const updates: Partial<LabTestOrder> = { status };
     if (status === 'Sample Collected') updates.collectedAt = new Date().toISOString();
-    if (status === 'Completed' || status === 'Reviewed') updates.completedAt = new Date().toISOString();
+    if (status === 'Released' || status === 'Completed' || status === 'Reviewed') {
+      updates.completedAt = new Date().toISOString();
+      updates.releasedAt = new Date().toISOString();
+      updates.isFinalVerified = true;
+    }
 
     setLabOrders((prev) =>
       prev.map((o) => {
@@ -2130,31 +2542,12 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   };
 
   const enterLabResults = (orderId: string, results: LabResultItem[], interpretation?: string, aiSummary?: string) => {
-    const updates = {
+    // Encode results as Preliminary first so Lab Technician explicitly verifies & releases final findings
+    void advanceLabWorkflow(orderId, {
+      action: 'encode-results',
       results,
-      interpretation,
-      aiSummary,
-      status: 'Completed' as const,
-      completedAt: new Date().toISOString(),
-    };
-
-    setLabOrders((prev) =>
-      prev.map((o) => (o.id === orderId ? { ...o, ...updates } : o))
-    );
-    logAction('LAB_RESULTS_ENTERED', 'Laboratory', orderId, `Diagnostic results entered for order`);
-
-    try {
-      const token = authToken || localStorage.getItem('smart_clinic_token');
-      fetch(`${API_BASE_URL}/api/lab-orders/${orderId}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-role': activeRole,
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify(updates),
-      }).catch(() => {});
-    } catch {}
+      interpretation: interpretation || aiSummary,
+    });
   };
 
   // Audited stock adjustment
@@ -2607,11 +3000,12 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     const fetchLiveNotifications = async () => {
       try {
         const token = authToken || localStorage.getItem('smart_clinic_token');
+        if (!token) return;
         const headers: Record<string, string> = {
           'x-user-role': activeRole,
           'x-background-poll': '1',
+          Authorization: `Bearer ${token}`,
         };
-        if (token) headers['Authorization'] = `Bearer ${token}`;
         if (currentUser?.id) headers['x-user-id'] = currentUser.id;
         if (currentUser?.email) headers['x-user-email'] = currentUser.email;
         if (linkedPatientId) headers['x-linked-patient-id'] = linkedPatientId;
@@ -2726,6 +3120,11 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
                 if (!exists) return [incomingApt, ...prev];
                 return prev.map((a) => (a.id === incomingApt.id ? { ...a, ...incomingApt } : a));
               });
+            }
+            if (payload.type === 'teleconsult:signal' || payload.type === 'teleconsult:participant_joined' || payload.type === 'teleconsult:ended') {
+              if (typeof window !== 'undefined') {
+                window.dispatchEvent(new CustomEvent('smartclinic:teleconsult-signal', { detail: payload }));
+              }
             }
             if (payload.type === 'patient:called') {
               if (payload.notification) {
@@ -2865,6 +3264,26 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const refreshSupabaseConfig = () => setSupabaseRefreshKey((k) => k + 1);
 
   const syncAllToSupabase = async () => {
+    try {
+      const token = authToken || localStorage.getItem('smart_clinic_token');
+      if (token) {
+        const apiRes = await fetch(`${API_BASE_URL}/api/supabase/sync`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        if (apiRes.ok) {
+          const body = await apiRes.json();
+          logAction('SUPABASE_FULL_SYNC', 'System', 'supabase-cloud', body.message || 'Server-side Supabase sync completed');
+          return body;
+        }
+      }
+    } catch {
+      // Fallback to authenticated Supabase session sync if backend endpoint is unreachable
+    }
+
     const res = await syncAllClinicDataToSupabase({
       patients,
       appointments,
@@ -2907,9 +3326,9 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       return { success: false, error: `An account with email "${cleanEmail}" is already registered in the system.` };
     }
 
-    const cleanLicense = doctorData.licenseNumber?.trim() || `PRC-${Math.floor(1000000 + Math.random() * 9000000)}`;
+    const cleanLicense = doctorData.licenseNumber?.trim() || `DEMO-MD-${Math.floor(100000 + Math.random() * 900000)}`;
     if (cleanLicense.length < 3) {
-      return { success: false, error: 'A valid PRC License or MD Credential number is required.' };
+      return { success: false, error: 'A valid demonstration credential ID is required.' };
     }
 
     const doctorId = `usr-${Date.now()}`;
@@ -2936,6 +3355,8 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       department: doctorData.department || 'General Medicine',
       specialty: doctorData.specialty || 'Internal & Family Medicine',
       licenseNumber: cleanLicense,
+      branches: ['Main Outpatient Clinic', 'Annex Satellite Clinic'],
+      consultationModes: ['In-Person', 'Online Consultation'],
       phone: doctorData.phone?.trim() || undefined,
       workDays: days,
       workDaysLabel: schedule.workDaysLabel,
@@ -2959,17 +3380,21 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       return updated;
     });
 
-    // Persist to server database if available
+    // Persist to server database if available (requires verified admin bearer token)
     try {
+      const token = authToken || localStorage.getItem('smart_clinic_token');
       await fetch(`${API_BASE_URL}/api/doctors`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({ ...doctorData, doctorId, licenseNumber: cleanLicense }),
       });
     } catch {}
 
     // Add audit log and notification
-    logAction('DOCTOR_CREDENTIALED', 'Security', doctorId, `New physician registered: ${cleanName} (${newDoctor.specialty}) • PRC ID: ${cleanLicense}`);
+    logAction('DOCTOR_CREDENTIALED', 'Security', doctorId, `New physician registered: ${cleanName} (${newDoctor.specialty}) • Demo ID: ${cleanLicense}`);
     addNotification({
       title: 'New Physician Registered',
       message: `${cleanName} (${newDoctor.specialty}) has been credentialed and added to the medical staff.`,
@@ -3518,6 +3943,23 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         sessionSecondsRemaining,
         sessionTimeoutTotal,
         resetSessionTimer,
+        setActiveClinicalSessionProtected,
+        inventoryTransactions,
+        restockRequests,
+        clinicSettings,
+        notificationPreferences,
+        reminderLogs,
+        createAppointmentVerified,
+        verifyAppointmentQr,
+        recordPatientVitals,
+        dispensePrescription,
+        updateReorderThreshold,
+        createRestockRequest,
+        updateRestockRequest,
+        advanceLabWorkflow,
+        updateClinicSettings,
+        updateNotificationPreferences,
+        runScheduledRemindersNow,
       }}
     >
       {children}

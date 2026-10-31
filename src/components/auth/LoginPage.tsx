@@ -43,7 +43,7 @@ import { API_BASE_URL } from '../../lib/config';
 type AuthMode = 'login' | 'register';
 
 export const LoginPage: React.FC = () => {
-  const { login, setActiveTab, pendingAction, language, t } = useClinic();
+  const { login, setActiveTab, pendingAction, t } = useClinic();
   const { success: toastSuccess, error: toastError } = useToast();
 
   const [primaryRole, setPrimaryRole] = useState<PrimaryAuthRole>('patient');
@@ -266,7 +266,7 @@ export const LoginPage: React.FC = () => {
           return;
         }
         if (!hasAgreedPrivacy) {
-          setError('Please review and accept the Patient Medical Privacy Policy & Consent Agreement (RA 10173) before creating your account.');
+          setError('Please review and accept the Patient Medical Privacy Policy & Consent Agreement before creating your account.');
           setLoading(false);
           return;
         }
@@ -353,10 +353,15 @@ export const LoginPage: React.FC = () => {
 
     // Doctor Provider Login
     if (isDoctor) {
+      if (!email.trim() || !password) {
+        setError('Please enter your provider work email and password.');
+        setLoading(false);
+        return;
+      }
       const res = await login({
         primaryRole: 'doctor',
-        email: email || 'maria.reyes@smartclinic.ph',
-        password: password || 'doctor123',
+        email: email.trim().toLowerCase(),
+        password,
         twoFactorCode: twoFactorCode.trim() || undefined,
       });
       setLoading(false);
@@ -372,18 +377,23 @@ export const LoginPage: React.FC = () => {
       }
       toastSuccess(
         pendingAction === 'queue'
-          ? 'Provider authenticated. Routing directly to Live Queue board.'
-          : 'Provider authenticated. Routing to Doctor Consultation Suite.'
+          ? 'Provider authenticated. Routing directly to Walk-In Queue.'
+          : 'Provider authenticated. Routing to Physician Clinical Dashboard.'
       );
       return;
     }
 
     // Staff Login (Nurse, Pharmacist, Receptionist, Lab Tech)
     if (isStaff) {
+      if (!email.trim() || !password) {
+        setError('Please enter your staff work email and password.');
+        setLoading(false);
+        return;
+      }
       const res = await login({
         primaryRole: 'staff',
-        email: email || `${staffSubRole}@smartclinic.ph`,
-        password: password || 'staff123',
+        email: email.trim().toLowerCase(),
+        password,
         subRole: staffSubRole,
         twoFactorCode: twoFactorCode.trim() || undefined,
       });
@@ -408,6 +418,11 @@ export const LoginPage: React.FC = () => {
 
     // Admin Login with 2FA
     if (isAdmin) {
+      if (!email.trim() || !password) {
+        setError('Please enter your administrator email and password.');
+        setLoading(false);
+        return;
+      }
       const finalAdminCode = twoFactorCode.trim();
       if (!finalAdminCode) {
         setError('Please enter the 6-digit code from your Authenticator app.');
@@ -417,8 +432,8 @@ export const LoginPage: React.FC = () => {
 
       const res = await login({
         primaryRole: 'admin',
-        email: email.trim().toLowerCase() || 'smartclinicrealacc@gmail.com',
-        password: password || 'SmartClinic@Admin2026',
+        email: email.trim().toLowerCase(),
+        password,
         twoFactorCode: finalAdminCode,
       });
 
@@ -456,8 +471,8 @@ export const LoginPage: React.FC = () => {
             </h1>
           </button>
           <div className="flex items-center justify-center gap-2 mt-2">
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200/80 dark:border-emerald-800/80 text-[10px] font-bold text-emerald-700 dark:text-emerald-300">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200/80 dark:border-emerald-800/80 text-[10px] font-bold text-emerald-700 dark:text-emerald-300">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
               {t.common.privacyCertified}
             </span>
           </div>
@@ -465,29 +480,29 @@ export const LoginPage: React.FC = () => {
 
         {/* Auth Gate Notification if Intercepted from 'Book Now' */}
         {pendingAction === 'book' && (
-          <div className="mb-4 p-3.5 rounded-xl bg-teal-50 dark:bg-teal-950/60 border border-teal-200 dark:border-teal-800 text-teal-800 dark:text-teal-200 text-xs flex items-center gap-2.5 animate-in fade-in duration-200">
+          <div className="mb-4 p-3.5 rounded-xl bg-teal-50 dark:bg-teal-950/60 border border-teal-200 dark:border-teal-800 text-teal-800 dark:text-teal-200 text-xs flex items-center gap-2.5">
             <UserCheck className="w-4 h-4 text-teal-600 shrink-0" />
             <span>
-              <strong>{language === 'fil' ? 'Pansamantalang Pagpigil sa Pag-book:' : 'Appointment Booking Gate:'}</strong> {language === 'fil' ? 'Mangyaring mag-sign in o magrehistro muna upang makumpirma ang inyong appointment.' : 'Please sign in or create an account to finalize your outpatient reservation. You will be redirected immediately.'}
+              <strong>Appointment Booking Gate:</strong> Please sign in or create an account to finalize your outpatient reservation. You will be redirected immediately.
             </span>
           </div>
         )}
 
         {/* Auth Gate Notification if Intercepted from 'View Live Queue' */}
         {pendingAction === 'queue' && (
-          <div className="mb-4 p-4 rounded-2xl bg-teal-50 dark:bg-teal-950/60 border border-teal-300 dark:border-teal-700 text-teal-900 dark:text-teal-100 text-xs flex items-start gap-3 shadow-xs animate-in fade-in duration-200">
+          <div className="mb-4 p-4 rounded-2xl bg-teal-50 dark:bg-teal-950/60 border border-teal-300 dark:border-teal-700 text-teal-900 dark:text-teal-100 text-xs flex items-start gap-3 shadow-xs">
             <div className="p-2 rounded-xl bg-teal-100 dark:bg-teal-900/60 text-teal-700 dark:text-teal-300 shrink-0">
               <Lock className="w-4 h-4" />
             </div>
             <div className="space-y-1">
               <div className="font-bold text-teal-900 dark:text-white flex items-center gap-2">
-                <span>{language === 'fil' ? 'Kinakailangan Mag-login Para sa Live Queue' : 'Authentication Required to View Live Queue'}</span>
-                <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full bg-teal-200/80 dark:bg-teal-800 text-teal-800 dark:text-teal-200">
-                  RA 10173 Protected
+                <span>Authentication Required to View Walk-In Queue</span>
+                <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-md bg-teal-200/80 dark:bg-teal-800 text-teal-800 dark:text-teal-200">
+                  RBAC Protected
                 </span>
               </div>
               <p className="text-teal-700 dark:text-teal-300 leading-relaxed">
-                {language === 'fil' ? 'Para sa proteksyon ng medikal na datos alinsunod sa batas ng Pilipinas, kinakailangan munang mag-login upang makita ang kasalukuyang pila ng pasyente.' : 'To protect outpatient medical privacy and clinical triage confidentiality under Philippine Health Data Security Standards, viewing live waiting room details and room calls requires authentication.'}
+                To protect patient privacy and clinical confidentiality, viewing walk-in waiting room details requires role-based authentication.
               </p>
             </div>
           </div>
@@ -924,7 +939,7 @@ export const LoginPage: React.FC = () => {
                     </div>
                   )}
 
-                  {/* Philippine Medical Data Privacy Consent (RA 10173) */}
+                  {/* Patient Medical Data Privacy Consent */}
                   <div className="p-3.5 rounded-2xl bg-teal-50/70 dark:bg-teal-950/40 border border-teal-200 dark:border-teal-800 space-y-2.5">
                     <div className="flex items-start gap-2.5">
                       <input
@@ -936,7 +951,7 @@ export const LoginPage: React.FC = () => {
                         className="mt-0.5 w-4 h-4 rounded border-teal-300 text-teal-600 focus:ring-teal-500 cursor-pointer accent-teal-600 shrink-0"
                       />
                       <label htmlFor="privacyConsent" className="text-[11px] text-teal-900 dark:text-teal-200 leading-relaxed cursor-pointer select-none">
-                        I have read, understood, and accept the <strong>Smart Clinic Patient Data Privacy Policy</strong> and consent to the secure processing of my medical and health records in accordance with <strong>Republic Act No. 10173 (Philippine Data Privacy Act of 2012)</strong>.
+                        I have read, understood, and accept the <strong>Smart Clinic Patient Data Privacy Notice</strong> and consent to the secure processing of my synthetic prototype health records for clinic scheduling and care management.
                       </label>
                     </div>
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 pt-1.5 border-t border-teal-100 dark:border-teal-900/60 text-[11px]">
@@ -946,7 +961,7 @@ export const LoginPage: React.FC = () => {
                         className="text-teal-700 dark:text-teal-300 font-bold hover:underline flex items-center gap-1.5 cursor-pointer text-left"
                       >
                         <Scale className="w-3.5 h-3.5 text-teal-600" />
-                        <span>Read Full Philippine Medical Privacy Standards & Data Charter</span>
+                        <span>Read Full Patient Privacy Notice & Security Safeguards</span>
                       </button>
                       <span className="text-[10px] text-teal-600/80 dark:text-teal-400/80 font-mono">
                         PBKDF2 Salted Hashing & Tenant Isolation
@@ -998,7 +1013,12 @@ export const LoginPage: React.FC = () => {
                         : isDoctor
                         ? 'maria.reyes@smartclinic.ph'
                         : isStaff
-                        ? `${staffSubRole}@smartclinic.ph`
+                        ? ({
+                            nurse: 'ana.villanueva@smartclinic.ph',
+                            receptionist: 'claire.mendoza@smartclinic.ph',
+                            pharmacist: 'julian.delacruz@smartclinic.ph',
+                            lab_technician: 'amina.bautista@smartclinic.ph',
+                          }[staffSubRole])
                         : 'patient@example.com'
                     }
                     className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 px-3 py-2.5 text-xs focus:ring-2 focus:ring-teal-500 font-medium"
@@ -1290,7 +1310,7 @@ export const LoginPage: React.FC = () => {
         onClose={() => setShowPrivacyModal(false)}
         onAgree={() => {
           setHasAgreedPrivacy(true);
-          toastSuccess('Agreed to Philippine Medical Privacy Policy (RA 10173).');
+          toastSuccess('Accepted Smart Clinic Patient Data Privacy Notice.');
         }}
       />
 

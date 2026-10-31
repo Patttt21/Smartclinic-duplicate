@@ -1,0 +1,1416 @@
+# SMARTCLINIC V2 — FINAL MASTER IMPLEMENTATION PROMPT
+
+## PROJECT INFORMATION
+
+**Project Title:** SmartClinic: A Role-Based Web Application Integrating Predictive Analysis for Healthcare Management
+
+**Project Type:** Academic Capstone — Responsive Healthcare Management Website
+
+**Existing Technology:** React, TypeScript, Vite, Supabase, PostgreSQL, and existing backend/API components.
+
+**Target Repository:** `Patttt21/Smartclinic-duplicate`
+
+**Target Database:** NEW independent SmartClinic Supabase project.
+
+## CRITICAL PROJECT INSTRUCTIONS
+
+You are modifying my EXISTING SmartClinic V2 application, not building a new application from scratch.
+
+Follow these instructions strictly:
+
+1. Modify ONLY the current SmartClinic duplicate project.
+2. NEVER modify the original SmartClinic GitHub repository or its original Supabase database.
+3. Preserve all working features, existing dashboards, components, database relationships, and predictive analytics.
+4. Inspect the actual source code before making any changes.
+5. Implement real functionality, not just redesigned interfaces or placeholder buttons.
+6. Do not fabricate doctors, patient records, laboratory results, inventory transactions, forecast accuracy, or test results.
+7. Use synthetic demonstration data only.
+8. Never expose private keys, credentials, database passwords, or service-role secrets.
+9. Never automatically execute SQL migrations, deploy the application, or push changes to GitHub.
+10. Keep the entire application compatible with the NEW independent Supabase project and the intended Vercel deployment.
+11. Follow existing coding conventions where practical.
+12. Ensure all dashboard features operate through a connected, securely authorized data layer.
+13. Avoid unnecessary external services and paid dependencies.
+14. If a feature requires an external provider, implement the safe integration points and clearly identify the required configuration.
+15. Perform real build, type checking, and applicable automated tests. Mark untested functionality accurately.
+
+The main objective is to deliver a functional, secure, responsive, English-only SmartClinic website for academic demonstration.
+
+---
+
+# PHASE 1 — FIX SUPABASE DATABASE SECURITY AND AUTHENTICATION
+
+The updated Migration 001 already includes several security improvements, but important vulnerabilities still require correction.
+
+## 1.1 Fix critical SECURITY DEFINER vulnerabilities
+
+Inspect and securely fix:
+
+- `guard_user_profile_mutation()`
+- `guard_patient_profile_mutation()`
+- `guard_patient_appointment_mutation()`
+
+These triggers contain `SECURITY DEFINER` and authorization checks using `current_user`, which can potentially cause authorization bypasses.
+
+Use verified caller identity, trusted claims, and appropriate security contexts.
+
+Ensure the fixes do not break legitimate Supabase Authentication registration triggers.
+
+## 1.2 Secure patient identity mapping
+
+- Remove insecure email-only patient identity matching.
+- Link patients to securely verified Supabase Auth identities.
+- Ensure patients cannot access another person's medical records.
+- Prevent registration from assigning privileged staff or administrator roles.
+- Prevent users from changing their own `role`, `sub_role`, `auth_user_id`, or protected account attributes.
+- Require authorized administrative procedures for privileged role assignment.
+
+## 1.3 Secure database access
+
+Review and correct all Row Level Security policies for:
+
+- Users and staff
+- Patients
+- Appointments
+- Consultations
+- Prescriptions
+- Prescription items
+- Laboratory orders and results
+- Inventory
+- Billing and invoices
+- Notifications
+- Forecasting
+- Audit logs
+- Authentication credentials and OTP records
+- Push subscriptions
+- File storage
+
+Protect password hashes and authentication secrets from public access.
+
+Restrict medical document access to authorized users.
+
+Prevent patients from editing clinical records, doctor-only fields, and protected appointment statuses.
+
+Ensure patients can only acknowledge their own notifications without changing notification ownership or content.
+
+Check function execution grants and security-invoker views for unauthorized data access.
+
+## 1.4 Review migrations and application compatibility
+
+Review:
+
+- Migration 001
+- Migration 002
+- Migration 003
+- `supabase/schema.sql`
+- `supabase/seed.sql`
+- Existing frontend Supabase client
+- Existing backend API and authentication code
+
+Resolve duplicated definitions, missing columns, incompatible queries, and unsafe policies.
+
+Use PostgreSQL constraints and database transactions where necessary.
+
+Do not execute SQL automatically.
+
+Do not assume that migration changes alone make the existing application secure.
+
+---
+
+# PHASE 2 — ENGLISH-ONLY WEBSITE AND RESPONSIVE DESIGN
+
+## 2.1 Remove Tagalog language functionality
+
+Make the entire application use English only.
+
+Remove:
+
+- Tagalog/Filipino language selection
+- Language-switching buttons
+- Unnecessary translation controls
+- Unused translation resources
+
+Ensure that all interface elements are in English:
+
+- Navigation
+- Dashboard headings
+- Forms
+- Validation messages
+- Notifications
+- Dialog boxes
+- Appointment confirmations
+- Reports
+- Error messages
+- Printable documents
+
+Do not alter the language of information manually entered by patients or doctors.
+
+## 2.2 Maintain professional website design
+
+Preserve and improve the existing design:
+
+- Minimalist blue-and-white theme
+- Clean medical dashboard layout
+- Mobile-responsive navigation
+- Consistent cards, tables, and buttons
+- Readable typography
+- Professional appointment calendar
+- Clear loading and error states
+- Accessible controls
+
+The website must work on desktop computers, tablets, Android phones, and iPhones.
+
+## 2.3 Remove Install App functionality
+
+Remove the visible:
+
+- Install App button
+- PWA installation popup
+- App installation banners
+- Promotional installation prompts
+
+Focus on a browser-based website accessible through a Vercel URL.
+
+Retain a service worker only if needed for supported browser notification functionality.
+
+Do not require users to install the application.
+
+---
+
+# PHASE 3 — PATIENT APPOINTMENT BOOKING SYSTEM
+
+Redesign the booking process into a simple, automatic, reliable workflow.
+
+## 3.1 Reason for consultation
+
+Before selecting a doctor, the patient must provide a reason for consultation.
+
+Example:
+
+"I have been experiencing frequent headaches for several days."
+
+The patient should be able to enter free-text descriptions of their symptoms or concerns.
+
+Other examples include:
+
+- Persistent cough
+- Recurring fever
+- Stomach discomfort
+- Back pain
+- Skin problems
+- Dizziness
+- Joint pain
+
+Store the patient's original description in the appointment record.
+
+## 3.2 Specialty and doctor recommendation
+
+Based on the patient's entered reason, display potentially appropriate medical specialties.
+
+Examples:
+
+- Recurring headaches: General Medicine / Family Medicine, with Neurology when available.
+- Skin concerns: Dermatology.
+- Cough and fever: General Medicine / Family Medicine.
+- General stomach discomfort: General Medicine / Internal Medicine.
+
+Use a transparent, non-diagnostic specialty matching mechanism.
+
+Important restrictions:
+
+- Do not diagnose the patient.
+- Do not recreate the removed AI Clinical Triage module.
+- Do not automatically prescribe treatments.
+- Do not guarantee that a suggested specialty is medically correct.
+- Let patients manually select a specialty if they prefer.
+- Recommend only specialties and doctors actually offered by the selected clinic branch.
+- If there is no suitable match, provide a general consultation option when available.
+
+## 3.3 Appointment booking workflow
+
+The booking process must follow this sequence:
+
+1. Patient selects the clinic branch.
+2. Patient enters the reason for consultation.
+3. System suggests appropriate available specialties.
+4. Patient selects a specialty.
+5. System displays actual available doctors.
+6. Patient selects a doctor.
+7. System displays the doctor's available dates.
+8. Patient selects a date.
+9. System displays available time slots.
+10. Patient chooses a time.
+11. Patient chooses In-Person or Online Consultation, depending on the doctor's supported schedules.
+12. Patient reviews the booking details.
+13. Patient confirms the appointment.
+14. System securely saves the booking.
+15. System automatically confirms the successful booking.
+16. System generates a booking reference and appropriate appointment access details.
+
+## 3.4 Automatic booking confirmation
+
+Remove manual staff approval from the normal booking workflow.
+
+Remove unnecessary:
+
+- Pending Approval status
+- Approve Booking button
+- Reject Booking button
+
+A booking must be automatically confirmed when:
+
+- The doctor exists.
+- The selected schedule is available.
+- The slot is successfully reserved.
+- All booking validation rules pass.
+
+Do not require the patient to wait for staff approval.
+
+A confirmed appointment must immediately appear in the relevant Patient, Doctor, and Staff dashboards.
+
+## 3.5 Prevent double-booking
+
+Implement server-side and database-level safeguards.
+
+- Recheck appointment availability when saving.
+- Prevent two patients from reserving the same doctor and overlapping appointment times.
+- Use atomic operations or suitable database constraints.
+- Account for appointment duration and schedule buffers.
+- Prevent conflicts between the doctor's In-Person and Online Consultation schedules.
+- Do not display fully booked slots as available.
+- Prevent bypassing availability validation through modified API requests.
+
+## 3.6 No same-day patient online booking
+
+Patients must not book appointments for today or any past date.
+
+The earliest available online booking date must be tomorrow, based on Philippine local time (`Asia/Manila`).
+
+Example:
+
+If today is October 31, the earliest bookable date is November 1.
+
+Requirements:
+
+- Disable today's date and all past dates in the calendar.
+- Apply validation on both frontend and backend.
+- Ensure the rule also applies to Online Consultation scheduling.
+- Show only genuinely available future slots.
+- Preserve authorized same-day staff walk-in registration.
+- Do not block staff from checking in today's already scheduled patients.
+
+Display:
+
+"Same-day online booking is unavailable. Please select an available date starting tomorrow."
+
+---
+
+# PHASE 4 — APPOINTMENT QR CODE AND CLINIC CHECK-IN
+
+For successfully booked In-Person appointments, generate a unique booking reference and secure QR code.
+
+## 4.1 Patient QR code
+
+The Patient Dashboard must display:
+
+- Booking Reference
+- Clinic Branch
+- Assigned Doctor
+- Appointment Date
+- Appointment Time
+- Consultation Type
+- Current Appointment Status
+- QR Code
+
+The patient can present the QR code upon arriving at the clinic.
+
+## 4.2 Staff QR scanning
+
+Authorized clinic staff must be able to:
+
+1. Open a working QR scanner.
+2. Scan the patient's appointment QR code.
+3. Validate the booking securely through the backend.
+4. Display the corresponding appointment information.
+5. Verify the patient's identity.
+6. Confirm check-in.
+7. Update the appointment status to "Checked In".
+
+The QR code must not directly expose sensitive medical information.
+
+Use an unpredictable, securely verifiable token.
+
+Prevent unauthorized scans from revealing patient records.
+
+Prevent duplicate check-ins.
+
+Provide manual booking reference lookup if QR scanning is unavailable.
+
+## 4.3 No ordinary walk-in queue for booked patients
+
+Patients with confirmed appointments already have reserved schedules.
+
+They must not be required to receive a regular walk-in queue number.
+
+Staff must not need to press Call Patient for normally scheduled appointments.
+
+After QR verification, the booked patient should proceed according to the confirmed consultation schedule.
+
+If a doctor is delayed, show an accurate appointment status and handle the delay appropriately; do not promise that physical waiting is always impossible.
+
+## 4.4 No-show management
+
+Maintain a working Mark as No-Show function for authorized staff.
+
+Use a configurable grace period, initially 30 minutes after the scheduled appointment time.
+
+If the patient fails to arrive:
+
+- Staff may mark the appointment No Show.
+- Record who marked it and when.
+- Release the unused capacity according to clinic policy.
+- Prevent unauthorized same-day rebooking after No Show.
+- Allow authorized staff overrides with a documented reason.
+- Preserve valid advance rescheduling.
+
+---
+
+# PHASE 5 — STAFF AND NURSE DASHBOARD
+
+Redesign staff workflows to clearly distinguish booked appointments from walk-in patients.
+
+## 5.1 Scheduled appointments
+
+Provide a section named:
+
+**Scheduled Appointments**
+
+Display:
+
+- Today's confirmed appointments
+- Upcoming appointments
+- Patient name
+- Assigned doctor
+- Scheduled time
+- Branch
+- Consultation type
+- Check-in status
+- No-show status
+
+Available actions:
+
+- Scan Appointment QR
+- Verify Patient
+- Check In
+- View Appointment
+- Mark No Show
+- Authorized Rescheduling
+- View relevant patient information
+
+Remove the normal Call Patient action for pre-booked appointments.
+
+Remove manual Approve Booking functionality.
+
+## 5.2 Walk-in patient registration
+
+Maintain a separate Walk-In Management section.
+
+When a walk-in patient arrives, staff should:
+
+1. Ask for the patient's required registration information.
+2. Optionally inspect a valid ID for identity verification.
+3. Search existing patient records.
+4. Determine whether the person is a returning or new patient.
+5. Reuse an existing verified patient record where appropriate.
+6. Create a new patient profile only when necessary.
+7. Register the walk-in visit.
+8. Assign an appropriate walk-in queue number.
+9. Proceed to pre-consultation nursing assessment.
+
+Collect only necessary personal information.
+
+Avoid storing copies of government identification unless genuinely needed and properly authorized.
+
+Do not create duplicate profiles when an existing patient record is verified.
+
+## 5.3 Walk-in live queue
+
+The Walk-In Queue must include:
+
+- Queue Number
+- Patient Name
+- Visit Status
+- Arrival Time
+- Assigned Department or Doctor
+- Nursing Vitals Status
+
+Keep a functional Call Patient action for walk-in patients.
+
+Do not use this walk-in queue for confirmed appointments.
+
+## 5.4 Pre-Consultation Nursing Vitals Intake
+
+For walk-in patients, retain the feature named:
+
+**Pre-Consultation Nursing Vitals Intake**
+
+When a nurse clicks Record Vital Signs, immediately open a functional entry form.
+
+Include:
+
+- Blood Pressure
+- Heart Rate
+- Body Temperature
+- Respiratory Rate
+- Oxygen Saturation (SpO₂)
+- Height
+- Weight
+- Optional clinical notes
+
+Validate reasonable input formats and units.
+
+On Save:
+
+- Save the measurements to the correct patient and visit.
+- Record date and time.
+- Record the authorized nurse who entered the measurements.
+- Display the saved values immediately.
+- Make the measurements available to the assigned doctor.
+- Preserve historical measurements without silently overwriting earlier entries.
+
+## 5.5 Remove Emergency Scan Mode
+
+Completely remove the Emergency Scan Mode button and its unnecessary workflow from the Nurse Dashboard.
+
+This is an outpatient clinic management system.
+
+Retain only a simple emergency referral notice where appropriate.
+
+---
+
+# PHASE 6 — DOCTOR DASHBOARD AND CONSULTATIONS
+
+Replace the existing Doctor Live Queue & Waiting Room section with appointment-focused features.
+
+## 6.1 Doctor Dashboard sections
+
+Create or improve:
+
+- Doctor Overview
+- Today's Appointments
+- Upcoming Appointments
+- Online Consultations
+- Patient Consultation Records
+- Record Vital Signs
+- Create Prescription
+- Laboratory Requests
+- Laboratory Results
+- Medicine Availability
+- Predictive Analytics
+
+## 6.2 Vital signs responsibilities
+
+For confirmed In-Person appointments:
+
+- Do not require pre-consultation nursing vitals intake.
+- The doctor should be able to record vital signs during the consultation.
+- The vitals form must save measurements to the patient's consultation record.
+
+For Walk-In patients:
+
+- Nursing staff should complete Pre-Consultation Nursing Vitals Intake.
+- The doctor should see the already recorded nursing measurements.
+- The doctor may review, supplement, or update measurements through authorized actions.
+- Maintain the original measurement history and attribution.
+
+For Online Consultations:
+
+- Do not invent physical measurements.
+- Allow the doctor to document patient-reported measurements when appropriate.
+- Clearly label such measurements as patient-reported.
+
+## 6.3 Appointment management
+
+The doctor must see:
+
+- Scheduled In-Person consultations
+- Scheduled Online Consultations
+- Appointment dates and times
+- Patient reason for consultation
+- Appointment status
+- Relevant patient history
+- Consultation documentation actions
+
+Doctor availability must synchronize with booking and cancellation updates.
+
+---
+
+# PHASE 7 — ONLINE CONSULTATION / TELECONSULTATION
+
+Implement a functional Online Consultation workflow accessible from both the Patient Dashboard and Doctor Dashboard.
+
+## 7.1 Patient features
+
+Allow patients to:
+
+- Book Online Consultations using available doctor schedules.
+- View upcoming online consultation appointments.
+- Receive reminders.
+- Open an authorized Join Consultation action.
+- Participate in a private video consultation.
+- View consultation status.
+- Access released prescriptions and appropriate consultation records.
+
+## 7.2 Doctor features
+
+Allow doctors to:
+
+- View scheduled online consultations.
+- Join authorized consultation sessions.
+- Review relevant patient information.
+- Record clinical notes.
+- Document assessments.
+- Record patient-reported vital signs if applicable.
+- Create and electronically issue prescriptions when clinically appropriate.
+- Request laboratory examinations if necessary.
+- Mark consultations Completed.
+
+## 7.3 Video consultation requirements
+
+Use a real, secure, technically supported video meeting integration.
+
+Do not create a fake video call interface that does not establish a real connection.
+
+Requirements:
+
+- Patient and assigned doctor access only.
+- Secure meeting/session authorization.
+- Respect device camera and microphone permissions.
+- Prevent unauthorized joining.
+- Handle connection failures gracefully.
+- Do not automatically record video sessions.
+- Display correct meeting status.
+- Prevent appointment conflicts.
+
+If the project lacks a configured video provider, implement the integration structure and clearly report what remains unconfigured or untested.
+
+Do not claim the video feature works without an actual successful end-to-end connection test.
+
+---
+
+# PHASE 8 — ELECTRONIC PRESCRIPTIONS
+
+Add or complete the Create Prescription functionality in the Doctor Dashboard.
+
+The doctor must be able to enter:
+
+- Patient
+- Consultation Reference
+- Medication
+- Generic Name, if available
+- Dosage
+- Frequency
+- Duration
+- Quantity
+- Administration Instructions
+- Prescription Date
+- Prescribing Doctor Details
+
+Only authorized doctors may issue prescriptions.
+
+The system must not autonomously prescribe medication or make clinical treatment decisions.
+
+After the doctor saves and issues a prescription:
+
+1. Store it in Supabase.
+2. Link it to the correct patient.
+3. Display it in the Patient Dashboard.
+4. Display it in the Pharmacist Dashboard.
+5. Provide functional View and Print actions.
+6. Maintain prescription history and status.
+
+Show appropriate verification information for digital prescriptions.
+
+Do not fabricate doctor signatures or license information.
+
+---
+
+# PHASE 9 — PHARMACIST DASHBOARD AND MEDICINE INVENTORY
+
+Implement complete prescription processing and inventory monitoring.
+
+## 9.1 Pharmacist Dashboard sections
+
+Include:
+
+- Pharmacy Overview
+- Incoming Prescriptions
+- Prescription Processing
+- Medicine Inventory
+- Low Stock Alerts
+- Stock Replenishment
+- Dispensing History
+- Pharmacy Reports
+
+## 9.2 Automatic prescription synchronization
+
+When a doctor creates a prescription, it must automatically appear in the Pharmacist Dashboard.
+
+The pharmacist should see:
+
+- Patient
+- Prescription Reference
+- Prescribing Doctor
+- Medication
+- Required Quantity
+- Instructions
+- Prescription Status
+- Available Stock
+
+## 9.3 Correct stock deduction
+
+IMPORTANT:
+
+Do NOT reduce physical medicine inventory immediately when a doctor writes a prescription.
+
+Actual stock must decrease when an authorized pharmacist successfully records dispensing.
+
+Workflow:
+
+Doctor Creates Prescription
+→ Pharmacist Receives Prescription
+→ Pharmacist Verifies Medicine and Quantity
+→ Pharmacist Dispenses Medication
+→ Inventory Quantity Decreases
+→ Transaction Is Recorded
+→ Updated Stock Appears in Relevant Dashboards
+
+Prevent duplicate dispensing from reducing stock twice.
+
+Use secure database transactions for inventory deductions.
+
+Prevent negative inventory quantities.
+
+Support partial dispensing when appropriate, with accurate remaining quantities.
+
+## 9.4 Low stock alerts
+
+Set a configurable reorder threshold for each medicine.
+
+Example:
+
+If the reorder threshold is 10 units and the remaining stock becomes 10 units or fewer, display:
+
+"Low Stock — Replenishment Recommended"
+
+The Pharmacist Dashboard must identify:
+
+- Low-stock medicines
+- Out-of-stock medicines
+- Current quantity
+- Reorder threshold
+- Batch and expiry information
+- Branch inventory location
+
+Provide a working Create Restock Request action.
+
+Do not automatically place real supplier orders without authorized integration and approval.
+
+## 9.5 Doctor medicine availability
+
+The Doctor Dashboard must display current stock availability when creating prescriptions.
+
+Show:
+
+- Medication name
+- Available stock
+- Stock unit
+- Branch
+- Low-stock or out-of-stock status
+
+Stock availability must refresh when dispensing or replenishment occurs.
+
+Warn the doctor when the selected quantity exceeds available stock.
+
+Do not automatically change prescribed dosage or reject clinically appropriate treatment solely because the clinic has insufficient inventory.
+
+The pharmacist manages actual dispensing availability.
+
+---
+
+# PHASE 10 — LABORATORY TECHNICIAN DASHBOARD
+
+Implement the complete laboratory workflow.
+
+## 10.1 Laboratory Dashboard sections
+
+Include the following:
+
+**Overview**
+- Laboratory statistics
+- Pending requests
+- In-progress examinations
+- Completed examinations
+- Released laboratory results
+
+**Lab Requests**
+- Doctor's test orders
+- Pending laboratory requests
+- Patient and doctor information
+- Requested test and priority
+
+**Patient Lab Queue**
+- Patients waiting for laboratory procedures
+- Appropriate queue status
+- Patient verification
+
+**Sample Collection**
+- Specimen collection
+- Collection date and time
+- Collecting personnel
+- Sample status
+
+**Test Processing**
+- Ongoing laboratory examinations
+- Processing status
+- Test completion
+
+**Result Encoding**
+- Enter laboratory findings
+- Measurements and units
+- Reference ranges where applicable
+- Preliminary result status
+
+**Laboratory Results**
+- Verification
+- Approval
+- Final result release
+- Amendment history when necessary
+
+**Laboratory Reports**
+- Daily test summary
+- Completed test counts
+- Pending test reports
+- Printable laboratory reports
+
+## 10.2 Complete laboratory workflow
+
+Implement this workflow:
+
+STEP 1 — Doctor Consultation
+
+The doctor requests a laboratory examination using a working Create Lab Request action.
+
+STEP 2 — Laboratory Request Received
+
+The new laboratory order is saved in Supabase and automatically appears in the Lab Tech Dashboard with status Pending Request.
+
+STEP 3 — Patient Verification and Sample Collection
+
+The lab technician verifies the correct patient and records the collected specimen.
+
+STEP 4 — Laboratory Testing
+
+The technician records processing status for the requested examination.
+
+STEP 5 — Result Encoding and Verification
+
+The technician enters laboratory findings.
+
+Authorized laboratory personnel must verify and approve the findings before release.
+
+STEP 6 — Laboratory Result Released
+
+After authorized verification and release:
+
+- Update the laboratory order status.
+- Make the final report available to the assigned doctor.
+- Make the authorized final report available in the Patient Portal.
+- Enable View, Download, and Print.
+- Record the releasing personnel and date/time.
+
+## 10.3 Automatic synchronization
+
+Doctors and receptionists must NOT need to re-encode laboratory results.
+
+A laboratory order created by the doctor should automatically reach the laboratory system.
+
+A verified final result should automatically become available to authorized recipients.
+
+Protect unverified, preliminary, and restricted results from premature patient release.
+
+Only authorized personnel may release or amend results.
+
+Maintain an audit trail.
+
+Do not fabricate test findings.
+
+---
+
+# PHASE 11 — PRINTING AND REPORT GENERATION
+
+Audit every existing Print, Download, and Export button.
+
+All visible Print buttons must work.
+
+Include applicable printing for:
+
+- Payment Receipts
+- Demonstration Official Receipts
+- Invoice Summaries
+- Appointment Confirmations
+- Appointment QR Codes
+- Prescriptions
+- Laboratory Requests
+- Laboratory Reports
+- Released Laboratory Results
+- Consultation Summaries
+- Medical Certificates, when legitimately issued
+- Authorized Patient Medical Summaries
+- Inventory Reports
+- Dispensing Reports
+- Daily Laboratory Reports
+- Administrative Reports
+- Predictive Analytics Reports
+
+## Printing behavior
+
+Clicking Print must open a valid printable document or browser print dialog.
+
+Use real saved record information.
+
+Requirements:
+
+- Professional print layout
+- Appropriate A4 sizing
+- Clear document heading
+- SmartClinic name
+- Patient and staff information where applicable
+- Document date and reference number
+- Relevant medical or financial details
+- Proper table formatting
+- No clipped content
+- No empty output
+- No sidebar or unrelated buttons in the printed document
+
+Use working browser printing or generated PDF files.
+
+Validate document authorization before revealing patient information.
+
+Do not fabricate prescriptions, laboratory reports, or medical certificates.
+
+For academic demonstration, label financial receipts clearly as:
+
+"DEMO — NOT VALID FOR OFFICIAL TAX PURPOSES"
+
+unless a legally compliant receipt system has been properly implemented and authorized.
+
+Do not leave nonfunctional Print buttons.
+
+---
+
+# PHASE 12 — APPOINTMENT REMINDERS AND NOTIFICATIONS
+
+Implement scheduled reminders for confirmed appointments.
+
+## 12.1 Reminder example
+
+A patient has a confirmed appointment tomorrow at 10:00 AM.
+
+The system should attempt to deliver the reminder today at approximately 10:00 AM, which is 24 hours before the appointment.
+
+Provide:
+
+- Immediate booking confirmation
+- Reminder approximately 24 hours before appointment
+- Optional reminder approximately 2 hours before appointment
+- Appointment changes and cancellation notices
+
+Use `Asia/Manila` for local scheduling and display.
+
+## 12.2 Notifications after logout
+
+The patient must not need an active website login session for the server to process scheduled reminders.
+
+Use server-side scheduled tasks and persisted notification records.
+
+Support Web Push where the browser and device permit it.
+
+Use VAPID keys securely.
+
+Request permission only through user interaction.
+
+IMPORTANT DEVICE LIMITATIONS:
+
+Browser-based background push notifications do not work identically on Android and iPhone.
+
+On iPhone, background Web Push generally requires an eligible Home Screen web app.
+
+Because SmartClinic is currently website-first and the Install App button must be removed, implement a practical fallback.
+
+Use properly configured email reminders as the primary cross-device fallback.
+
+SMS may be optional if a configured provider is available.
+
+Never claim successful phone, email, SMS, or push delivery without an actual tested integration.
+
+## 12.3 Notification requirements
+
+- Avoid duplicate reminders.
+- Cancel reminders for cancelled appointments.
+- Update reminders after rescheduling.
+- Maintain delivery logs.
+- Support notification preferences and consent.
+- Do not reveal sensitive medical details on lock screens.
+- Use secure links for appointment details.
+- Show in-app notifications when a patient returns.
+
+Make the scheduled job compatible with the chosen deployment infrastructure and its plan limits.
+
+---
+
+# PHASE 13 — 10-MINUTE INACTIVITY TIMEOUT
+
+Replace the previous 30-minute inactivity logout with a 10-minute timeout.
+
+Requirements:
+
+- Apply to Patient, Doctor, Clinic Staff, Pharmacist, Lab Technician, and Administrator sessions.
+- Count actual inactivity, not total time logged in.
+- Reset the inactivity timer when users interact meaningfully with the application.
+- Avoid interrupting active form entry, consultation documentation, and QR scanning.
+- Show a warning approximately 1 minute before logout.
+- Provide a working Stay Signed In action.
+- After timeout, securely end the application session and redirect to Login.
+- Protect server-side operations with valid authentication and authorization.
+- Handle simultaneous tabs consistently where practical.
+- Remove sensitive local session information after logout.
+- Do not disable properly authorized appointment reminder delivery simply because the website session ended.
+
+Make inactivity settings configurable.
+
+---
+
+# PHASE 14 — PREDICTIVE ANALYTICS FOR DOCTOR AND STAFF
+
+Predictive Analytics is a central academic requirement of SmartClinic.
+
+Preserve and improve the existing forecasting system.
+
+## 14.1 Forecast dashboard visibility
+
+Predictive Analytics must be available to:
+
+- Administrator
+- Doctor
+- Authorized Clinic Staff / Nurse
+
+Doctors and staff should independently see the forecast without waiting for someone else to tell them.
+
+## 14.2 Forecast functionality
+
+Display:
+
+- Historical monthly patient visits
+- Expected patient volume for upcoming months
+- Branch-specific forecasts
+- Monthly trends
+- Higher-demand periods
+- Forecast confidence or uncertainty where supported
+- Model used
+- Evaluation results
+- Last forecast update
+
+Example:
+
+The system may estimate how many patient consultations the clinic could expect during November, December, or later months.
+
+These are forecasts of clinic demand, NOT exact predictions of how many people in the population will become sick.
+
+## 14.3 Consultation category forecasting
+
+Where properly recorded historical consultation categories exist, allow forecasting of category-specific consultation demand.
+
+Examples:
+
+- Respiratory-related consultations
+- Fever-related consultations
+- General medical consultations
+
+Do not represent this functionality as disease diagnosis, outbreak detection, or scientifically validated disease incidence prediction.
+
+## 14.4 Forecast data quality
+
+Use consistent definitions for:
+
+- Booked appointments
+- Completed consultations
+- Unique patients
+- Walk-in visits
+- Synthetic historical records
+
+Do not mix these measures without explicit labeling.
+
+Use chronological historical validation.
+
+Compare suitable forecasting baselines.
+
+Show actual computed evaluation metrics such as MAE where applicable.
+
+Use reproducible synthetic data for academic demonstration when real authorized historical data is unavailable.
+
+Clearly label synthetic results as simulated.
+
+Do not fabricate accuracy measurements or forecast values.
+
+---
+
+# PHASE 15 — ADMINISTRATOR DASHBOARD AND ROLE MANAGEMENT
+
+Preserve the existing Administrator Dashboard and ensure that it remains compatible with all new workflows.
+
+Administrators should have appropriate oversight of:
+
+- User accounts
+- Staff and doctor profiles
+- Role assignments
+- Clinic branches
+- Doctor schedules
+- Appointment statistics
+- Walk-in activity
+- Pharmacy inventory summaries
+- Laboratory activity summaries
+- Predictive Analytics
+- Audit logs
+- System settings
+
+Requirements:
+
+- Use verified authorization for privileged actions.
+- Prevent patient self-promotion to administrator or staff.
+- Allow authorized configuration of appointment grace periods, schedules, and operational settings.
+- Preserve audit trails for sensitive changes.
+- Do not expose passwords, OTP secrets, private API keys, or unnecessary medical information.
+
+Do not create fake privileged accounts or hardcoded administrator credentials.
+
+---
+
+# PHASE 16 — END-TO-END DATA SYNCHRONIZATION
+
+All relevant dashboards must use the same secure database.
+
+When an authorized action is performed, related dashboards must reflect the saved update.
+
+Required synchronization examples:
+
+**Appointment Booking**
+Patient books → Slot is reserved → Doctor sees appointment → Staff sees appointment → Patient sees confirmation.
+
+**In-Person Check-In**
+Patient presents QR → Staff scans → Backend verifies → Appointment becomes Checked In → Doctor sees updated status.
+
+**Walk-In Consultation**
+Staff registers patient → Nurse records vital signs → Doctor sees patient and nursing vitals.
+
+**Online Consultation**
+Patient and doctor join scheduled consultation → Doctor saves consultation notes → Authorized records become available.
+
+**Prescription**
+Doctor creates prescription → Patient can view prescription → Pharmacist receives prescription → Pharmacist dispenses → Inventory decreases → Doctor and pharmacist see updated stock.
+
+**Laboratory**
+Doctor requests test → Lab Tech sees Pending Request → Sample collected → Test processed → Results verified and released → Doctor and patient see final report.
+
+**Predictive Analytics**
+Authorized historical visits and consultations are stored → Forecast computation uses appropriate historical aggregates → Doctor, Staff, and Admin see updated forecasts.
+
+Requirements:
+
+- Use reliable database updates.
+- Use real-time subscriptions or controlled refresh mechanisms where appropriate.
+- Prevent duplicate transactions.
+- Maintain data consistency.
+- Handle failed network requests gracefully.
+- Never display unsaved changes as confirmed records.
+- Preserve authorized access boundaries.
+
+---
+
+# PHASE 17 — DEPLOYMENT COMPATIBILITY
+
+Prepare SmartClinic for deployment using:
+
+**GitHub:** `Patttt21/Smartclinic-duplicate`
+
+**Hosting:** Vercel
+
+**Database:** New independent Supabase project
+
+Before deployment:
+
+1. Inspect `package.json`.
+2. Inspect `vercel.json`.
+3. Inspect `server.ts` and API routes.
+4. Identify frontend and backend build requirements.
+5. Verify the Vite output directory.
+6. Verify backend routes can operate in the intended Vercel environment.
+7. Identify required environment variable names.
+8. Distinguish public frontend variables from server-only secrets.
+9. Ensure the Supabase service-role key is never exposed to browser code.
+10. Check Supabase Authentication redirect URLs.
+11. Check appointment reminder scheduling compatibility.
+12. Check video consultation and email provider requirements.
+13. Verify that the application does not depend on unavailable local-only services.
+14. Avoid introducing unnecessary paid infrastructure.
+
+Do not deploy automatically.
+
+Do not execute database migrations automatically.
+
+Do not push to GitHub automatically.
+
+Provide manual deployment instructions after implementation and verification.
+
+---
+
+# PHASE 18 — REQUIRED TESTING AND VERIFICATION
+
+Perform applicable automated tests and report real results.
+
+## Security testing
+
+- Anonymous users cannot read protected patient data.
+- Patients cannot read another patient's medical records.
+- Patients cannot become administrators.
+- Users cannot modify protected identity mappings.
+- Unauthorized users cannot access laboratory reports.
+- Unauthorized users cannot access private QR booking details.
+- Service-role secrets never enter frontend bundles.
+- Database security triggers enforce verified caller authorization.
+
+## Patient booking testing
+
+- Patient can enter a reason for consultation.
+- Specialty matching returns valid options.
+- Available doctors are shown correctly.
+- Doctor availability reflects actual schedules.
+- Today's date cannot be booked.
+- Past dates cannot be booked.
+- Duplicate and overlapping bookings are rejected.
+- Successful bookings are automatically confirmed.
+- QR codes are generated.
+- QR scanning works.
+- Duplicate QR check-ins are prevented.
+- Booked patients are not assigned walk-in queue numbers.
+
+## Staff/Nurse testing
+
+- Staff can search existing patients.
+- Staff can register new walk-ins.
+- Duplicate patient registration is minimized.
+- Walk-in queue actions work.
+- Nursing vital signs form opens.
+- Vital signs are saved correctly.
+- Saved vitals appear in the doctor's patient record.
+- Staff can mark eligible appointments No Show.
+- Emergency Scan Mode is removed.
+- Booking approval buttons are removed.
+
+## Doctor testing
+
+- Doctor sees confirmed appointments.
+- Doctor sees online consultation schedules.
+- Booked patients can have doctor-entered vital signs.
+- Walk-in patients show nursing vitals.
+- Consultation records save properly.
+- Prescriptions save and appear in the patient portal.
+- Lab requests appear automatically in Lab Tech Dashboard.
+- Stock availability is correctly displayed.
+- Predictive Analytics is accessible.
+
+## Online consultation testing
+
+- Patient can join an authorized session.
+- Doctor can join the same session.
+- Unauthorized users are blocked.
+- Video and audio work when a provider is configured.
+- Consultation status changes correctly.
+- Prescriptions are accessible after issuance.
+
+## Pharmacy testing
+
+- Prescriptions appear in the pharmacist dashboard.
+- Inventory is not reduced on prescription creation.
+- Inventory decreases on authorized dispensing.
+- Duplicate dispensing does not deduct stock twice.
+- Out-of-stock warnings work.
+- Low-stock warnings trigger at configured thresholds.
+- Stock changes are reflected in the doctor dashboard.
+- Restock recording updates quantities.
+
+## Laboratory testing
+
+- Doctor orders appear as Pending Requests.
+- Patient verification works.
+- Sample collection is recorded.
+- Test processing status updates.
+- Lab findings save correctly.
+- Only authorized personnel may verify and release results.
+- Released results appear in doctor and patient dashboards.
+- Unverified results are not presented to patients as final.
+- Laboratory reports print correctly.
+
+## General functionality testing
+
+- All Print buttons work.
+- All relevant Download buttons work.
+- The website interface uses English only.
+- The Install App button and prompts are removed.
+- Reminder scheduling is correct.
+- Reminder delivery works only through configured, verified channels.
+- Session timeout occurs after 10 minutes of inactivity.
+- Active interactions reset the inactivity timer.
+- Predictive Analytics uses valid source data.
+- Mobile responsiveness works.
+- Production build succeeds.
+
+Never claim tests passed unless they were actually executed.
+
+Clearly distinguish:
+
+- PASS
+- FAIL
+- NOT TESTED
+- BLOCKED BY EXTERNAL CONFIGURATION
+
+---
+
+# PHASE 19 — REQUIRED IMPLEMENTATION ORDER
+
+Because this is a large existing application, implement changes in the safest dependency order.
+
+Do not attempt to rewrite the whole project in one uncontrolled operation.
+
+Priority 1:
+Database security, authentication, and schema compatibility.
+
+Priority 2:
+Patient booking, automatic confirmation, availability validation, QR codes, and check-in.
+
+Priority 3:
+Staff/Nurse walk-in management and vital signs.
+
+Priority 4:
+Doctor appointments, consultation documentation, and online consultation.
+
+Priority 5:
+Electronic prescriptions, pharmacy synchronization, inventory management, and stock alerts.
+
+Priority 6:
+Laboratory requests, testing workflow, verification, release, and reporting.
+
+Priority 7:
+Working printing and downloadable documents.
+
+Priority 8:
+Server-side appointment reminders, email/Web Push integration, and notification preferences.
+
+Priority 9:
+English-only interface, removal of Install App, removal of Emergency Scan Mode, and 10-minute inactivity timeout.
+
+Priority 10:
+Predictive Analytics integration for Doctor, Staff, and Administrator dashboards.
+
+Priority 11:
+End-to-end regression testing, deployment compatibility, and documentation.
+
+Complete and verify dependent components before moving on to higher-level workflows.
+
+If context or execution limits prevent full completion, preserve the completed changes, identify exactly what remains, and do not claim full completion.
+
+---
+
+# PHASE 20 — FINAL IMPLEMENTATION REPORT
+
+After modifying the actual project source code, provide a structured report containing:
+
+1. **Completed Features**
+   - What was actually implemented.
+
+2. **Modified Files**
+   - Exact filenames and their changes.
+
+3. **Database Changes**
+   - Updated migration filenames.
+   - Schema changes.
+   - RLS and authorization changes.
+   - Required manual execution order.
+
+4. **Dashboard Changes**
+   - Patient
+   - Doctor
+   - Nurse/Staff
+   - Pharmacist
+   - Lab Technician
+   - Administrator
+
+5. **Print Functions**
+   - Which documents can actually be printed.
+   - Which actions were tested.
+
+6. **Appointment Notifications**
+   - Implemented channels.
+   - Required providers.
+   - Device limitations.
+   - Verified versus unverified delivery.
+
+7. **Online Consultation**
+   - Video integration implemented.
+   - External setup required.
+   - Actual test status.
+
+8. **Environment Variables**
+   - Exact required names only.
+   - No private values.
+
+9. **Testing Results**
+   - Actual commands executed.
+   - Passed tests.
+   - Failed tests.
+   - Tests that could not run.
+
+10. **Incomplete or Blocked Features**
+    - Explicit outstanding tasks.
+
+11. **Security Limitations**
+    - Any unresolved risks.
+
+12. **Deployment Readiness**
+    - Whether the project is ready for manual Supabase migration and Vercel deployment.
+
+13. **GitHub Instructions**
+    - How to manually review, commit, and push the changes to `Patttt21/Smartclinic-duplicate`.
+
+## FINAL NON-NEGOTIABLE RULES
+
+- Do not modify the original SmartClinic repository.
+- Do not modify the original database.
+- Do not automatically deploy.
+- Do not automatically run SQL.
+- Do not automatically push GitHub commits.
+- Do not expose credentials.
+- Do not fabricate test results.
+- Do not replace existing working components unnecessarily.
+- Do not create nonfunctional placeholder buttons.
+- Do not claim an external integration is working without verification.
+- Do not confuse synthetic academic data with real clinical information.
+- Do not claim compliance with healthcare or privacy laws without proper assessment.
+
+**FINAL OBJECTIVE:**
+
+Deliver a secure, consistent, functional, English-only SmartClinic web application where patients can automatically book appointments, receive QR codes and reminders, consult doctors in person or online, access prescriptions and released laboratory results; staff can manage scheduled and walk-in patients; doctors can manage consultations and view inventory and forecasts; pharmacists can process prescriptions and update actual medicine stock; laboratory technicians can process and release test results; and administrators can oversee the system securely.
+
+Preserve the existing SmartClinic project and its predictive analytics functionality while making the entire workflow suitable for academic demonstration and future Vercel deployment.
+
+ACTUALLY INSPECT AND MODIFY THE EXISTING CODE. REPORT ONLY VERIFIED RESULTS.

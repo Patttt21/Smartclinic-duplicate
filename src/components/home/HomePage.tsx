@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { useClinic } from '../../context/ClinicContext';
 import { SmartClinicLogo } from '../common/SmartClinicLogo';
-import { PWAInstallButton } from '../common/PWAInstallButton';
 import { PrivacyPolicyModal } from '../auth/PrivacyPolicyModal';
 import {
   Calendar,
@@ -39,7 +38,7 @@ interface HomePageProps {
 }
 
 export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => {
-  const { setActiveTab, appointments, patients, isAuthenticated, currentUser, setPendingAction, users, language, t } = useClinic();
+  const { setActiveTab, appointments, isAuthenticated, currentUser, setPendingAction, users, t } = useClinic();
   const [showPrivacyModal, setShowPrivacyModal] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -127,31 +126,30 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
                 </span>
               </div>
               <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase tracking-widest font-semibold">
-                {language === 'fil' ? 'Pangangalagang Pangkalusugan' : 'Outpatient & Clinical Management'}
+                Outpatient & Clinical Management
               </p>
             </div>
           </div>
 
           <nav className="hidden lg:flex items-center gap-6 xl:gap-7 text-sm font-medium text-slate-600 dark:text-slate-300">
-            <a href="#services" className="hover:text-teal-600 dark:hover:text-teal-400 transition">{language === 'fil' ? 'Mga Serbisyo' : 'Services'}</a>
-            <a href="#specialties" className="hover:text-teal-600 dark:hover:text-teal-400 transition">{language === 'fil' ? 'Mga Espesyalista' : 'Clinical Specialties'}</a>
-            <a href="#portals" className="hover:text-teal-600 dark:hover:text-teal-400 transition">{language === 'fil' ? 'Portal ng Klinika' : 'Clinic Portals'}</a>
-            <a href="#standards" className="hover:text-teal-600 dark:hover:text-teal-400 transition">{language === 'fil' ? 'Seguridad ng Datos' : 'Standards'}</a>
+            <a href="#services" className="hover:text-teal-600 dark:hover:text-teal-400 transition">Services</a>
+            <a href="#specialties" className="hover:text-teal-600 dark:hover:text-teal-400 transition">Clinical Specialties</a>
+            <a href="#portals" className="hover:text-teal-600 dark:hover:text-teal-400 transition">Clinic Portals</a>
+            <a href="#standards" className="hover:text-teal-600 dark:hover:text-teal-400 transition">Security & Scope</a>
             <button
               type="button"
               onClick={() => setShowPrivacyModal(true)}
               className="hover:text-teal-600 dark:hover:text-teal-400 transition cursor-pointer font-medium"
             >
-              {language === 'fil' ? 'Patakaran sa Privacy' : 'Privacy Policy'}
+              Privacy Notice
             </button>
           </nav>
 
           <div className="flex items-center gap-2.5">
-            <PWAInstallButton compact />
             {isAuthenticated ? (
               <button
                 onClick={() => setActiveTab('dashboard')}
-                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 active:bg-teal-800 rounded-lg shadow-sm transition cursor-pointer"
+                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 active:bg-teal-800 rounded-lg shadow-sm transition cursor-pointer whitespace-nowrap"
               >
                 <span>{t.nav.dashboard}</span>
                 <span className="text-xs font-normal opacity-90 capitalize">({currentUser.role})</span>
@@ -161,18 +159,18 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
               <>
                 <button
                   onClick={() => setActiveTab('login')}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:text-teal-600 dark:hover:text-teal-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:text-teal-600 dark:hover:text-teal-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition cursor-pointer whitespace-nowrap"
                 >
                   <LogIn className="w-4 h-4" />
                   <span>{t.nav.signIn}</span>
                 </button>
                 <button
                   onClick={onOpenBookAppointment}
-                  className="inline-flex items-center gap-2 px-3.5 sm:px-4 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 active:bg-teal-800 rounded-lg shadow-sm hover:shadow transition cursor-pointer"
+                  className="inline-flex items-center gap-2 px-3.5 sm:px-4 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 active:bg-teal-800 rounded-lg shadow-sm hover:shadow transition cursor-pointer whitespace-nowrap"
                 >
                   <Calendar className="w-4 h-4" />
                   <span className="hidden sm:inline">{t.common.bookAppointment}</span>
-                  <span className="sm:hidden">{language === 'fil' ? 'Mag-book' : 'Book'}</span>
+                  <span className="sm:hidden">Book</span>
                 </button>
               </>
             )}
@@ -282,17 +280,17 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
               </div>
 
               {/* Badges / Micro Proof */}
-              <div className="pt-6 border-t border-slate-200 dark:border-slate-800 grid grid-cols-3 gap-4 text-center lg:text-left">
+              <div className="pt-6 border-t border-slate-200 dark:border-slate-800 grid grid-cols-3 gap-4 text-center lg:text-left tabular-nums">
                 <div>
                   <div className="text-2xl font-bold text-slate-900 dark:text-white">100%</div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400">{language === 'fil' ? 'Digital na Rekord' : 'Digital Health Records'}</div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400">Digital Health Records</div>
                 </div>
                 <div>
                   <div className="text-2xl font-bold text-teal-600 dark:text-teal-400">{avgWaitMinutes} min</div>
                   <div className="text-xs text-slate-500 dark:text-slate-400">{t.home.avgWaitTime}</div>
                 </div>
                 <div>
-                  <div className="text-2xl font-bold text-slate-900 dark:text-white">RA 10173</div>
+                  <div className="text-2xl font-bold text-slate-900 dark:text-white">RBAC</div>
                   <div className="text-xs text-slate-500 dark:text-slate-400">{t.common.privacyCertified}</div>
                 </div>
               </div>
@@ -305,31 +303,27 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
 
                 <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800">
                   <div className="flex items-center gap-2.5">
-                    <span className="relative flex h-3 w-3">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
-                    </span>
+                    <span className="inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
                     <div>
                       <span className="text-sm font-bold text-slate-800 dark:text-slate-100 block leading-tight">{t.home.liveQueueTitle}</span>
                       <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-semibold flex items-center gap-1 mt-0.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                        {language === 'fil' ? 'Direktang Nakakonekta sa Klinika' : 'Synced Live with Inside EMR'}
+                        Synced Live with Clinic EMR
                       </span>
                     </div>
                   </div>
-                  <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 border border-emerald-200/80 dark:border-emerald-800">
-                    {language === 'fil' ? 'Bukas Ngayon' : 'Open Now • PST'}
+                  <span className="text-xs font-semibold px-2.5 py-1 rounded-md bg-emerald-50 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+                    Open Now • PHT
                   </span>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3 my-4">
+                <div className="grid grid-cols-2 gap-3 my-4 tabular-nums">
                   <div className="bg-slate-50 dark:bg-slate-800/60 p-3.5 rounded-xl border border-slate-100 dark:border-slate-800">
                     <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-1">
                       <span>{t.home.waitingInQueue}</span>
                       <Clock className="w-3.5 h-3.5 text-teal-600" />
                     </div>
                     <div className="text-2xl font-bold text-slate-900 dark:text-white">
-                      {waitingInQueue} <span className="text-xs font-normal text-slate-500">{language === 'fil' ? 'pasyente' : 'patients'}</span>
+                      {waitingInQueue} <span className="text-xs font-normal text-slate-500">patients</span>
                     </div>
                   </div>
 
@@ -339,7 +333,7 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
                       <Activity className="w-3.5 h-3.5 text-cyan-600" />
                     </div>
                     <div className="text-2xl font-bold text-slate-900 dark:text-white">
-                      {activeInConsult} <span className="text-xs font-normal text-slate-500">{language === 'fil' ? 'aktibo' : 'active'}</span>
+                      {activeInConsult} <span className="text-xs font-normal text-slate-500">active</span>
                     </div>
                   </div>
                 </div>
@@ -540,7 +534,7 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
               Board-Certified Clinical Specialties
             </h2>
             <p className="text-slate-600 dark:text-slate-300 text-sm mt-3">
-              Licensed healthcare professionals and outpatient specialists practicing under strict Philippine medical board and RA 10173 data privacy protocols.
+              Outpatient specialists and clinical faculty available across Main Outpatient Clinic and Annex Satellite Clinic.
             </p>
           </div>
 
@@ -557,17 +551,17 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
                   </div>
                   <div className="text-left space-y-1.5 flex-1">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="inline-block px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-teal-50 dark:bg-teal-950/60 text-teal-700 dark:text-teal-300">
+                      <span className="inline-block px-2.5 py-0.5 rounded-md text-[11px] font-semibold bg-teal-50 dark:bg-teal-950/60 text-teal-700 dark:text-teal-300">
                         {doc.department}
                       </span>
                       <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400 font-medium">
-                        <BadgeCheck className="w-3.5 h-3.5" /> Verified
+                        <BadgeCheck className="w-3.5 h-3.5" /> Active Roster
                       </span>
                     </div>
                     <h3 className="text-lg font-bold text-slate-900 dark:text-white">{doc.name}</h3>
                     <p className="text-xs text-slate-600 dark:text-slate-400 font-medium">{doc.specialty}</p>
                     <div className="text-[11px] text-slate-400 font-mono">
-                      PRC License: {doc.licenseNumber || 'Active Clinical License'}
+                      Demo Staff ID: {doc.licenseNumber || 'DEMO-MD'}
                     </div>
                     <div className="text-[11px] text-teal-700 dark:text-teal-300 font-semibold flex items-center gap-1.5 bg-teal-50/70 dark:bg-teal-950/40 p-2 rounded-xl border border-teal-200/60 dark:border-teal-800/50">
                       <Clock className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 shrink-0" />
@@ -699,9 +693,9 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
                   <ShieldCheck className="w-6 h-6" />
                 </div>
                 <div>
-                  <h4 className="font-bold text-sm text-slate-900 dark:text-white">RA 10173 Compliance</h4>
+                  <h4 className="font-bold text-sm text-slate-900 dark:text-white">Role-Based Data Isolation</h4>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                    Compliant with Philippine Data Privacy Act of 2012 for patient consent and health record security.
+                    Strict authenticated patient and clinical role boundaries safeguard synthetic outpatient records.
                   </p>
                 </div>
               </div>
@@ -778,10 +772,10 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
                 className="hover:text-teal-600 dark:hover:text-teal-400 hover:underline flex items-center gap-1 cursor-pointer font-bold text-slate-700 dark:text-slate-300"
               >
                 <ShieldCheck className="w-3.5 h-3.5 text-teal-600" />
-                <span>Republic Act No. 10173 (Privacy Policy)</span>
+                <span>Patient Data Privacy Notice</span>
               </button>
               <span>•</span>
-              <span>DOH Outpatient Standards</span>
+              <span>Academic Capstone Prototype</span>
               <span>•</span>
               <button
                 onClick={() => setActiveTab('login')}
@@ -794,7 +788,6 @@ export const HomePage: React.FC<HomePageProps> = ({ onOpenBookAppointment }) => 
         </div>
       </footer>
 
-      {/* Philippine Medical Privacy Policy Modal (RA 10173) */}
       <PrivacyPolicyModal
         isOpen={showPrivacyModal}
         onClose={() => setShowPrivacyModal(false)}

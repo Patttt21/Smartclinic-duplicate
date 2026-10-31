@@ -79,7 +79,6 @@ const ClinicAppContent: React.FC = () => {
   const [showNewPrescription, setShowNewPrescription] = useState(false);
   const [showSupabaseModal, setShowSupabaseModal] = useState(false);
   const [showScanQRModal, setShowScanQRModal] = useState(false);
-  const [scanQRMode, setScanQRMode] = useState<'checkin' | 'emergency'>('checkin');
   const [detailPatient, setDetailPatient] = useState<Patient | null>(null);
   const [qrPatient, setQrPatient] = useState<Patient | null>(null);
   const [labOrderForResults, setLabOrderForResults] = useState<LabTestOrder | null>(null);
@@ -150,7 +149,7 @@ const ClinicAppContent: React.FC = () => {
     }
   }, [isAuthenticated, setIsBookAppointmentOpen]);
 
-  // Strict Role & Permission Tab Isolation Guard (Enforce RA 10173 and strip unauthorized modules)
+  // Strict Role & Permission Tab Isolation Guard
   useEffect(() => {
     if (!isAuthenticated) return;
     const tabPermissionMap: Record<string, any> = {
@@ -166,16 +165,16 @@ const ClinicAppContent: React.FC = () => {
       inventory: 'pharmacy',
       billing: 'billing',
       reports: 'reports',
-      'predictive-analytics': 'reports',
+      'predictive-analytics': 'predictiveAnalytics',
       'audit-logs': 'auditLogs',
     };
 
     const roleTabMap: Record<string, string[]> = {
       patient: ['home', 'dashboard', 'appointments', 'queue', 'emr', 'prescriptions', 'laboratory', 'billing', 'notifications'],
       admin: ['home', 'dashboard', 'patients', 'doctors', 'clinical-staff', 'staff-management', 'consultations', 'audit-logs', 'reports', 'predictive-analytics', 'billing', 'inventory', 'notifications'],
-      doctor: ['home', 'dashboard', 'patients', 'appointments', 'queue', 'consultations', 'prescriptions', 'laboratory', 'inventory', 'notifications'],
-      nurse: ['home', 'dashboard', 'patients', 'scan-qr', 'appointments', 'queue', 'consultations', 'laboratory', 'notifications'],
-      receptionist: ['home', 'dashboard', 'patients', 'scan-qr', 'appointments', 'queue', 'billing', 'notifications'],
+      doctor: ['home', 'dashboard', 'patients', 'appointments', 'consultations', 'prescriptions', 'laboratory', 'inventory', 'predictive-analytics', 'notifications'],
+      nurse: ['home', 'dashboard', 'patients', 'scan-qr', 'appointments', 'queue', 'consultations', 'laboratory', 'predictive-analytics', 'notifications'],
+      receptionist: ['home', 'dashboard', 'patients', 'scan-qr', 'appointments', 'queue', 'billing', 'predictive-analytics', 'notifications'],
       pharmacist: ['home', 'dashboard', 'prescriptions', 'inventory', 'notifications'],
       lab_technician: ['home', 'dashboard', 'laboratory', 'notifications'],
     };
@@ -239,8 +238,7 @@ const ClinicAppContent: React.FC = () => {
             onOpenBookAppointment={openBookAppointment}
             onOpenNewPatient={() => setShowNewPatient(true)}
             onOpenSupabaseModal={() => setShowSupabaseModal(true)}
-            onOpenScanQR={(mode) => {
-              setScanQRMode(mode || 'checkin');
+            onOpenScanQR={() => {
               setShowScanQRModal(true);
             }}
             onOpenProfileSettings={() => setShowProfileSettings(true)}
@@ -307,15 +305,13 @@ const ClinicAppContent: React.FC = () => {
                     openBookAppointment();
                   }}
                   onOpenScanQR={() => {
-                    setScanQRMode('checkin');
                     setShowScanQRModal(true);
                   }}
                 />
               )}
               {activeTab === 'scan-qr' && (
                 <ScanHealthIdPage
-                  onOpenScanner={(mode) => {
-                    setScanQRMode(mode);
+                  onOpenScanner={() => {
                     setShowScanQRModal(true);
                   }}
                   onStartConsultation={handleStartConsultation}
@@ -324,10 +320,7 @@ const ClinicAppContent: React.FC = () => {
               {activeTab === 'emr' && (
                 <PatientEMRView
                   onOpenQR={() => {
-                    const pat =
-                      patients.find((p) => p.id === linkedPatientId) ||
-                      patients.find((p) => p.email && currentUser.email && p.email.toLowerCase() === currentUser.email.toLowerCase()) ||
-                      patients[0];
+                    const pat = patients.find((p) => linkedPatientId && p.id === linkedPatientId);
                     if (pat) setQrPatient(pat);
                   }}
                   onOpenBookAppointment={openBookAppointment}
@@ -389,7 +382,6 @@ const ClinicAppContent: React.FC = () => {
       <ScanHealthIdModal
         isOpen={showScanQRModal}
         onClose={() => setShowScanQRModal(false)}
-        initialMode={scanQRMode}
         onStartConsultation={handleStartConsultation}
       />
       {showProfileSettings && (

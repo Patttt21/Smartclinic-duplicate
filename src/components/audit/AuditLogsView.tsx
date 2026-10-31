@@ -4,7 +4,7 @@ import { ShieldCheck, Search, Filter, Clock, User, ShieldAlert, FileText, Mail, 
 import { API_BASE_URL } from '../../lib/config';
 
 export const AuditLogsView: React.FC = () => {
-  const { auditLogs } = useClinic();
+  const { auditLogs, authToken } = useClinic();
   const [activeTab, setActiveTab] = useState<'clinical' | 'communication'>('clinical');
   const [filterAction, setFilterAction] = useState('ALL');
   const [search, setSearch] = useState('');
@@ -15,7 +15,10 @@ export const AuditLogsView: React.FC = () => {
   const fetchCommLogs = async () => {
     setLoadingComm(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/communication/logs`);
+      const token = authToken || localStorage.getItem('smart_clinic_token');
+      const res = await fetch(`${API_BASE_URL}/api/communication/logs`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       const data = await res.json();
       if (data.success && Array.isArray(data.logs)) {
         setCommLogs(data.logs);

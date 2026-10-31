@@ -653,7 +653,8 @@ export function getDoctorSlotAvailability(
   dateStr: string,
   appointments: Appointment[],
   excludeAppointmentId?: string,
-  fallbackUser?: User
+  fallbackUser?: User,
+  slotDurationMinutes = 30
 ): SlotAvailability[] {
   if (!doctorId || !dateStr) return [];
 
@@ -665,11 +666,20 @@ export function getDoctorSlotAvailability(
 
   const schedule = getDoctorSchedule(doctorId, fallbackUser);
 
-  // Find all active booked appointments for this doctor on this date
+  const parseMins = (raw: string): number | null => {
+    const norm = normalizeTimeTo24Hour(raw);
+    const m = norm.match(/^(\d{2}):(\d{2})$/);
+    if (!m) return null;
+    return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+  };
+
+  // Find all active booked appointments for this doctor on this date (across both In-Person and Online Consultation)
   const bookedOnDate = appointments.filter((a) => {
+    if (a.isSynthetic) return false;
+    if (a.isWalkIn || a.type === 'Walk-In') return false;
     const aDate = (a.date || '').split('T')[0].trim();
     if (aDate !== cleanTargetDate) return false;
-    if (a.status === 'Cancelled') return false;
+    if (a.status === 'Cancelled' || a.status === 'No Show') return false;
     if (excludeAppointmentId && a.id === excludeAppointmentId) return false;
 
     const matchesId =
@@ -685,19 +695,21 @@ export function getDoctorSlotAvailability(
     return Boolean(matchesId || matchesName);
   });
 
-  const bookedMap = new Map<string, Appointment>();
-  bookedOnDate.forEach((a) => {
-    const norm = normalizeTimeTo24Hour(a.time);
-    bookedMap.set(norm, a);
-    if (a.time) {
-      bookedMap.set(a.time.trim(), a);
-    }
-  });
-
   return schedule.slots.map((slot) => {
     const normSlot = normalizeTimeTo24Hour(slot);
-    const bookedAppointment = bookedMap.get(normSlot) || bookedMap.get(slot);
-    const isBooked = !!bookedAppointment;
+    const slotStart = parseMins(normSlot);
+    const slotEnd = slotStart !== null ? slotStart + Math.max(15, slotDurationMinutes) : null;
+
+    const bookedAppointment = bookedOnDate.find((a) => {
+      const aNorm = normalizeTimeTo24Hour(a.time);
+      if (aNorm === normSlot) return true;
+      const aStart = parseMins(aNorm);
+      if (slotStart === null || slotEnd === null || aStart === null) return false;
+      const aEnd = aStart + Math.max(15, Number(a.durationMinutes) || 30);
+      return slotStart < aEnd && aStart < slotEnd;
+    });
+
+    const isBooked = Boolean(bookedAppointment);
     return {
       slot: normSlot,
       formatted: formatTimeSlot(normSlot),

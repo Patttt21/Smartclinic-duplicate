@@ -1,10 +1,8 @@
 /**
  * Smart Clinic — Authentication, Token Signing, Inactivity Session Security & RBAC Tenancy Guard
  * Cryptographically signed HMAC-SHA256 tokens using Node.js crypto.
- * Enforces strict patient isolation (RA 10173) and role-based inactivity expiration:
- * - Patient: 30 minutes (1800s)
- * - Clinic Staff (Doctor, Nurse, Receptionist, Pharmacist, Lab Tech): 15 minutes (900s)
- * - System Administrator: 15 minutes (900s)
+ * Enforces strict patient data isolation and configurable 10-minute (600s) inactivity expiration across all roles:
+ * - Patient, Doctor, Clinic Staff (Nurse, Receptionist, Pharmacist, Lab Tech), Administrator: 10 minutes (600s)
  */
 import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
@@ -12,11 +10,18 @@ import { Request, Response, NextFunction } from 'express';
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours absolute token cap
 
+export const DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 10 * 60; // 10 minutes (600 seconds)
+
+let configuredTimeoutSeconds =
+  Number(process.env.SESSION_TIMEOUT_SECONDS) ||
+  Number(process.env.SESSION_TIMEOUT_PATIENT_SEC) ||
+  DEFAULT_INACTIVITY_TIMEOUT_SECONDS;
+
 export const ROLE_INACTIVITY_TIMEOUT_SECONDS = {
-  patient: Number(process.env.SESSION_TIMEOUT_PATIENT_SEC) || 30 * 60, // 30 minutes
-  staff: Number(process.env.SESSION_TIMEOUT_STAFF_SEC) || 15 * 60,     // 15 minutes
-  admin: Number(process.env.SESSION_TIMEOUT_ADMIN_SEC) || 15 * 60,     // 15 minutes
-} as const;
+  patient: configuredTimeoutSeconds,
+  staff: configuredTimeoutSeconds,
+  admin: configuredTimeoutSeconds,
+};
 
 export interface UserTokenPayload {
   userId: string;
@@ -50,11 +55,20 @@ interface ActiveSessionEntry {
 
 const activeSessions = new Map<string, ActiveSessionEntry>();
 
-export function getRoleTimeoutSeconds(role?: string): number {
-  const normalized = String(role || 'patient').toLowerCase();
-  if (normalized === 'patient') return ROLE_INACTIVITY_TIMEOUT_SECONDS.patient;
-  if (normalized === 'admin') return ROLE_INACTIVITY_TIMEOUT_SECONDS.admin;
-  return ROLE_INACTIVITY_TIMEOUT_SECONDS.staff;
+export function setGlobalInactivityTimeoutSeconds(seconds: number): number {
+  const clamped = Math.max(120, Math.min(3600, Math.round(Number(seconds) || DEFAULT_INACTIVITY_TIMEOUT_SECONDS)));
+  configuredTimeoutSeconds = clamped;
+  ROLE_INACTIVITY_TIMEOUT_SECONDS.patient = clamped;
+  ROLE_INACTIVITY_TIMEOUT_SECONDS.staff = clamped;
+  ROLE_INACTIVITY_TIMEOUT_SECONDS.admin = clamped;
+  for (const entry of activeSessions.values()) {
+    entry.timeoutMs = clamped * 1000;
+  }
+  return clamped;
+}
+
+export function getRoleTimeoutSeconds(_role?: string): number {
+  return configuredTimeoutSeconds;
 }
 
 function getSessionKey(token: string, payload: UserTokenPayload): string {
@@ -249,6 +263,7 @@ export function authMiddleware(req: AuthenticatedRequest, res: Response, next: N
     req.path.startsWith('/auth/totp') ||
     req.path.startsWith('/auth/forgot-password') ||
     req.path.startsWith('/auth/reset-password') ||
+    req.path.startsWith('/cron') ||
     req.path === '/health' ||
     req.path === '/status';
 
@@ -279,21 +294,65 @@ export function authMiddleware(req: AuthenticatedRequest, res: Response, next: N
     }
   }
 
-  // Header fallback for unauthenticated public routes or local test handshakes
-  req.userId = (req.headers['x-user-id'] as string) || undefined;
-  req.userRole = String(req.headers['x-user-role'] || '').toLowerCase() || undefined;
-  req.linkedPatientId = (req.headers['x-linked-patient-id'] as string) || null;
+  // Never trust unverified x-user-role, x-user-id, or x-linked-patient-id headers
+  req.user = undefined;
+  req.userId = undefined;
+  req.userRole = undefined;
+  req.linkedPatientId = null;
+  req.authToken = undefined;
   next();
 }
+
+/**
+ * Requires a cryptographically verified bearer session token on the request.
+ */
+export function requireVerifiedAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (!req.user || !req.authToken || !req.user.userId || !req.user.role) {
+    return res.status(401).json({
+      error: 'Authentication required. Please sign in with a valid clinic account.',
+      code: 'AUTH_REQUIRED',
+    });
+  }
+  next();
+}
+
+/**
+ * Requires a cryptographically verified session whose bound role is in allowedRoles.
+ */
+export function requireVerifiedRoles(...allowedRoles: string[]) {
+  const normalizedAllowed = new Set(allowedRoles.map((r) => r.toLowerCase()));
+  return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    if (!req.user || !req.authToken || !req.user.userId || !req.user.role) {
+      return res.status(401).json({
+        error: 'Authentication required. Please sign in with an authorized account.',
+        code: 'AUTH_REQUIRED',
+      });
+    }
+    const verifiedRole = String(req.user.role).toLowerCase();
+    if (!normalizedAllowed.has(verifiedRole)) {
+      return res.status(403).json({
+        error: `Forbidden: Role '${verifiedRole}' is not authorized for this operation.`,
+        code: 'ROLE_FORBIDDEN',
+      });
+    }
+    next();
+  };
+}
+
+/**
+ * Strict administrative authorization guard.
+ * Requires a verified session with role === 'admin'.
+ */
+export const requireAdmin = requireVerifiedRoles('admin');
 
 /**
  * Middleware ensuring patient tenancy isolation.
  * Patients can never access other patients' records via query or param.
  */
 export function enforcePatientIsolation(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const role = req.userRole || req.user?.role;
+  const role = req.user?.role;
   const isPatient = role === 'patient';
-  const linkedId = req.linkedPatientId || req.user?.linkedPatientId;
+  const linkedId = req.user?.linkedPatientId || req.linkedPatientId;
 
   if (isPatient) {
     if (!linkedId) {
@@ -305,7 +364,7 @@ export function enforcePatientIsolation(req: AuthenticatedRequest, res: Response
     const targetPatientId = req.params.patientId || req.params.id || req.query.patientId;
     if (targetPatientId && targetPatientId !== linkedId) {
       return res.status(403).json({
-        error: 'Data Isolation Violation: You are not authorized to view or modify other patients’ medical records (RA 10173).',
+        error: 'Data Isolation Violation: You are not authorized to view or modify other patients’ medical records.',
       });
     }
   }

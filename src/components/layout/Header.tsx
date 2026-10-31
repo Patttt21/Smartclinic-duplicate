@@ -4,33 +4,25 @@ import { SmartClinicLogo } from '../common/SmartClinicLogo';
 import { NotificationDetailModal } from '../notifications/NotificationDetailModal';
 import { canUserScanQR } from '../../utils/qrPermissions';
 import { isSupabaseConfigured } from '../../lib/supabase';
-import { PWAInstallButton } from '../common/PWAInstallButton';
 import type { Notification } from '../../types/clinic';
 import {
   Search,
   Bell,
   Clock,
-  CheckCircle2,
-  AlertTriangle,
   User,
   X,
-  Plus,
   Database,
   LogOut,
   Lock,
-  ShieldCheck,
   QrCode,
   Menu,
-  Stethoscope,
-  Users,
-  Layers,
 } from 'lucide-react';
 
 interface Props {
   onOpenBookAppointment?: () => void;
   onOpenNewPatient?: () => void;
   onOpenSupabaseModal?: () => void;
-  onOpenScanQR?: (mode?: 'checkin' | 'emergency') => void;
+  onOpenScanQR?: () => void;
   onOpenProfileSettings?: () => void;
   onToggleMobileMenu?: () => void;
 }
@@ -97,7 +89,7 @@ export const Header: React.FC<Props> = ({
         )
       : [];
   const filteredInventory =
-    !isPatient && activeRole !== 'pharmacist' && (activeRole as string) !== 'pharmacy' && searchQuery.trim()
+    !isPatient && (activeRole === 'pharmacist' || activeRole === 'doctor' || activeRole === 'admin') && searchQuery.trim()
       ? inventory.filter(
           (i) =>
             i.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -150,9 +142,9 @@ export const Header: React.FC<Props> = ({
                 <span className="bg-gradient-to-r from-teal-500/20 to-cyan-500/20 text-cyan-300 font-bold text-[10px] px-2 py-0.5 rounded-full border border-cyan-500/30 uppercase tracking-wide">
                   {isPatient ? 'Patient Portal' : isAdmin ? 'Executive Governance' : 'Clinical Hub'}
                 </span>
-                <span className="hidden xl:inline-flex items-center gap-1 bg-emerald-950/60 text-emerald-300 font-bold text-[9px] px-2 py-0.5 rounded-full border border-emerald-500/40 uppercase">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                  RA 10173 Certified
+                <span className="hidden xl:inline-flex items-center gap-1 bg-emerald-950/60 text-emerald-300 font-bold text-[9px] px-2 py-0.5 rounded-md border border-emerald-500/40 uppercase">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                  RBAC Protected
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 font-medium leading-tight hidden sm:block mt-0.5">
@@ -289,20 +281,18 @@ export const Header: React.FC<Props> = ({
         ) : (
           <div className="flex-1 max-w-lg hidden sm:flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-teal-950/40 border border-teal-500/30 text-teal-200 text-xs font-medium">
             <Lock className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-            <span className="truncate">Data Privacy Act (RA 10173) Session · Personal Health Record Only</span>
+            <span className="truncate">Role-Based Isolated Session · Personal Health Record Only</span>
           </div>
         )}
 
         {/* Right: User / Profile / Security Controls */}
         <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
-          <PWAInstallButton compact />
-
           {/* Inactivity Session Timer Indicator */}
           {isAuthenticated && (
             <div
-              className={`hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-xl text-[11px] font-mono font-bold border transition ${
-                sessionSecondsRemaining <= 120
-                  ? 'bg-amber-950/80 text-amber-300 border-amber-500 animate-pulse'
+              className={`hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-xl text-[11px] font-mono font-bold tabular-nums border transition ${
+                sessionSecondsRemaining <= 60
+                  ? 'bg-amber-950/80 text-amber-300 border-amber-500'
                   : 'bg-[#11192c] text-cyan-300 border-slate-700/80 shadow-xs'
               }`}
               title={`${t.common.sessionRemaining}: ${Math.floor(sessionSecondsRemaining / 60)}m ${
@@ -311,7 +301,7 @@ export const Header: React.FC<Props> = ({
             >
               <Clock
                 className={`w-3.5 h-3.5 ${
-                  sessionSecondsRemaining <= 120 ? 'text-amber-400 animate-spin' : 'text-cyan-400'
+                  sessionSecondsRemaining <= 60 ? 'text-amber-400' : 'text-cyan-400'
                 }`}
               />
               <span>
@@ -321,15 +311,15 @@ export const Header: React.FC<Props> = ({
             </div>
           )}
 
-          {/* QR Code Scanner (Nurses & Receptionists) */}
+          {/* Appointment QR Scanner (Nurses & Receptionists) */}
           {!isPatient && onOpenScanQR && canUserScanQR(activeRole, primaryRole, staffSubRole) && (
             <button
-              onClick={() => onOpenScanQR('checkin')}
-              className="px-2.5 py-1.5 text-xs font-semibold text-cyan-200 bg-[#11192c] hover:bg-[#16233d] border border-cyan-500/30 rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-xs active:scale-95"
-              title="Scan Patient Health ID QR"
+              onClick={() => onOpenScanQR()}
+              className="px-2.5 py-1.5 text-xs font-semibold text-cyan-200 bg-[#11192c] hover:bg-[#16233d] border border-cyan-500/30 rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-xs whitespace-nowrap"
+              title="Scan Appointment QR"
             >
               <QrCode className="w-3.5 h-3.5 text-cyan-400" />
-              <span className="hidden lg:inline">{t.nav.scanHealthId}</span>
+              <span className="hidden lg:inline">Scan Appointment QR</span>
             </button>
           )}
 

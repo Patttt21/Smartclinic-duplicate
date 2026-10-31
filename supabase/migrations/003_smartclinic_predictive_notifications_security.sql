@@ -47,14 +47,14 @@ BEGIN
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_appointments_branch_date
-  ON public.appointments (branch, date);
+  ON public.appointments (branch, appointment_date);
 
 CREATE INDEX IF NOT EXISTS idx_appointments_patient_status_date
-  ON public.appointments (patient_id, status, date);
+  ON public.appointments (patient_id, status, appointment_date);
 
 -- Prevent double-booking of non-walk-in active appointments on the same doctor + date + time slot
 CREATE UNIQUE INDEX IF NOT EXISTS uq_appointments_active_doctor_slot
-  ON public.appointments (doctor_id, date, time)
+  ON public.appointments (doctor_id, appointment_date, appointment_time)
   WHERE status IN ('Scheduled', 'Confirmed', 'Checked In', 'Called', 'In Consultation')
     AND COALESCE(is_walk_in, false) = false
     AND COALESCE(is_synthetic, false) = false;
@@ -66,7 +66,7 @@ ALTER TABLE IF EXISTS public.consultations
   ADD COLUMN IF NOT EXISTS is_synthetic boolean DEFAULT false;
 
 CREATE INDEX IF NOT EXISTS idx_consultations_branch_date
-  ON public.consultations (branch, date);
+  ON public.consultations (branch, consultation_date);
 
 -- 3. Extend `notifications` for queue_call real-time acknowledgment tracking
 ALTER TABLE IF EXISTS public.notifications
@@ -106,40 +106,57 @@ CREATE TABLE IF NOT EXISTS public.forecast_runs (
   is_synthetic_dataset boolean NOT NULL DEFAULT true
 );
 
--- 6. Row Level Security (RLS) Policies — Strict Patient Isolation
+-- 6. Row Level Security (RLS) Policies — Strict Patient Isolation & Verified Role Checks
 ALTER TABLE public.push_subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.forecast_runs ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS "Patients manage own push subscriptions" ON public.push_subscriptions;
-CREATE POLICY "Patients manage own push subscriptions"
+DROP POLICY IF EXISTS "push_subscriptions_manage_own" ON public.push_subscriptions;
+CREATE POLICY "push_subscriptions_manage_own"
   ON public.push_subscriptions
   FOR ALL
   TO authenticated
-  USING (auth.uid()::text = user_id)
-  WITH CHECK (auth.uid()::text = user_id);
+  USING (
+    user_id = auth.uid()::text
+    OR user_id = public.current_user_id()
+    OR (patient_id IS NOT NULL AND patient_id = public.current_patient_id())
+  )
+  WITH CHECK (
+    user_id = auth.uid()::text
+    OR user_id = public.current_user_id()
+    OR (patient_id IS NOT NULL AND patient_id = public.current_patient_id())
+  );
 
 DROP POLICY IF EXISTS "Admins read and insert forecast runs" ON public.forecast_runs;
-CREATE POLICY "Admins read and insert forecast runs"
+DROP POLICY IF EXISTS "forecast_runs_admin_only" ON public.forecast_runs;
+DROP POLICY IF EXISTS "forecast_runs_select_authorized" ON public.forecast_runs;
+CREATE POLICY "forecast_runs_select_authorized"
   ON public.forecast_runs
-  FOR ALL
+  FOR SELECT
   TO authenticated
-  USING ((auth.jwt() -> 'user_metadata' ->> 'role') = 'admin')
-  WITH CHECK ((auth.jwt() -> 'user_metadata' ->> 'role') = 'admin');
+  USING (public.has_any_role(ARRAY['admin', 'doctor', 'nurse', 'receptionist']));
+
+DROP POLICY IF EXISTS "forecast_runs_insert_authorized" ON public.forecast_runs;
+CREATE POLICY "forecast_runs_insert_authorized"
+  ON public.forecast_runs
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (public.has_any_role(ARRAY['admin', 'doctor', 'nurse', 'receptionist']));
 
 -- =============================================================================
--- SUPABASE AUTH SESSION SECURITY & PLAN LIMITATIONS DOCUMENTATION (PART 8)
+-- SUPABASE AUTH SESSION SECURITY & PLAN LIMITATIONS DOCUMENTATION (PHASE 13)
 -- =============================================================================
--- 1. Application-Layer Role-Based Inactivity Enforcement (Active on ALL Plans):
---    - Patient Portal: 30 minutes (1800s) idle timeout; warning modal at 28m (120s left).
---    - Clinic Staff & Administrator: 15 minutes (900s) idle timeout; warning modal at 13m (120s left).
+-- 1. Application-Layer Inactivity Enforcement (Active on ALL Plans):
+--    - All Roles (Patient, Doctor, Nurse, Receptionist, Pharmacist, Lab Tech, Admin):
+--      10 minutes (600s) configurable idle timeout; warning modal at 9m (60s left).
 --    - Background polling requests (`x-background-poll: 1`) never reset user idle timers.
 --    - Server-side `authService.ts` independently tracks `lastActivityAt` per bearer token
 --      and revokes expired tokens with HTTP 401 (`SESSION_INACTIVITY_EXPIRED`).
 -- 2. Supabase Auth JWT & Session Settings:
---    - On Supabase Free Tier: Configure JWT Expiry (`JWT_EXPIRY`) to `1800` seconds (30 min)
---      under Authentication -> Sessions in the duplicate Supabase dashboard.
---    - On Supabase Pro Plan+: Native server-side `Inactivity timeout` and `Time-box user sessions`
---      can additionally be enabled in Authentication -> Sessions to mirror the 15m/30m thresholds.
+--    - On Supabase Free Tier: Configure JWT Expiry (`JWT_EXPIRY`) to `900`–`1800` seconds
+--      under Authentication -> Sessions in the new SmartClinic V2 Supabase dashboard.
+--    - On Supabase Pro Plan+: Native server-side `Inactivity timeout` can additionally be
+--      enabled in Authentication -> Sessions to mirror the 10-minute (600s) threshold.
 -- =============================================================================
 
 COMMIT;

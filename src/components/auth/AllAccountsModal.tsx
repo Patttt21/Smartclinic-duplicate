@@ -52,7 +52,7 @@ export const ALL_SYSTEM_ACCOUNTS: SystemAccount[] = [
     primaryRole: 'admin',
     role: 'admin',
     password: 'SmartClinic@Admin2026',
-    notes: 'Full administrative access, financial oversight, RA 10173 audit logs, Supabase integration. Requires Authenticator 2FA.',
+    notes: 'Full administrative access, predictive analytics, security audit logs, Supabase integration. Requires Authenticator 2FA.',
     badge: 'Admin',
     badgeColor: 'bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800',
     department: 'Executive Management',
@@ -647,7 +647,7 @@ export const AllAccountsModal: React.FC<Props> = ({ isOpen, onClose, onSelectAcc
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
             <span>
-              Directly synchronized with Supabase PostgreSQL. Protected under Philippine Data Privacy Act (RA 10173).
+              Synthetic demonstration directory synchronized with SmartClinic RBAC & Row-Level Security policies.
             </span>
           </div>
           <button

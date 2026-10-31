@@ -88,7 +88,7 @@ export const clearSupabaseCredentials = () => {
 export const testSupabaseConnection = async (
   testUrl?: string,
   testKey?: string
-): Promise<{ success: boolean; message: string; tablesFound?: boolean; needsGrants?: boolean }> => {
+): Promise<{ success: boolean; message: string; tablesFound?: boolean; needsGrants?: boolean; rlsProtected?: boolean }> => {
   const url = (testUrl || getSupabaseUrl()).trim();
   const key = (testKey || getSupabaseAnonKey()).trim();
 
@@ -110,7 +110,7 @@ export const testSupabaseConnection = async (
         return {
           success: true,
           tablesFound: false,
-          message: 'Connected to Supabase project! Note: Tables have not been run yet. Please execute /supabase/schema.sql in your Supabase SQL Editor.',
+          message: 'Connected to Supabase project! Note: Tables have not been created yet. Apply Migration 001 in your Supabase SQL Editor.',
         };
       }
 
@@ -118,8 +118,9 @@ export const testSupabaseConnection = async (
         return {
           success: true,
           tablesFound: true,
-          needsGrants: true,
-          message: 'Connected to Supabase project! Tables exist, but role permissions need to be granted. Please run the GRANT query in your Supabase SQL Editor.',
+          rlsProtected: true,
+          needsGrants: false,
+          message: 'Connected to Supabase project! Database tables exist and anonymous public access is properly blocked by Row Level Security.',
         };
       }
 
@@ -174,15 +175,28 @@ export const supabase: SupabaseClient | null = new Proxy({} as SupabaseClient, {
   },
 });
 
-// 1. Patient Sync
-export async function syncPatientToSupabase(patient: any) {
+async function getAuthenticatedBrowserSupabaseClient(): Promise<SupabaseClient | null> {
   const client = getSupabaseClient();
   if (!client) return null;
+  try {
+    const { data } = await client.auth.getSession();
+    if (!data?.session) return null;
+    return client;
+  } catch {
+    return null;
+  }
+}
+
+// 1. Patient Sync (Authenticated Supabase session only; Express API handles server-side persistence)
+export async function syncPatientToSupabase(patient: any) {
+  const client = await getAuthenticatedBrowserSupabaseClient();
+  if (!client || !patient) return null;
   try {
     const { data, error } = await client
       .from('patients')
       .upsert(
         {
+          id: patient.id,
           mrn: patient.mrn,
           full_name: patient.fullName,
           dob: patient.dob,
@@ -219,7 +233,7 @@ export async function syncPatientToSupabase(patient: any) {
 
 // 2. Appointment Sync
 export async function syncAppointmentToSupabase(appointment: any) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client || !appointment) return null;
   try {
     const { data, error } = await client
@@ -260,12 +274,14 @@ export async function syncAppointmentToSupabase(appointment: any) {
 
 // 3. Consultation Sync
 export async function syncConsultationToSupabase(consultation: any) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client) return null;
   try {
     const { data, error } = await client
       .from('consultations')
-      .insert({
+      .upsert({
+        id: consultation.id || `con-${Date.now()}`,
+        patient_id: consultation.patientId || null,
         appointment_id: consultation.appointmentId || null,
         patient_name: consultation.patientName,
         doctor_id: consultation.doctorId,
@@ -300,13 +316,15 @@ export async function syncConsultationToSupabase(consultation: any) {
 
 // 4. Prescription Sync
 export async function syncPrescriptionToSupabase(prescription: any) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client) return null;
   try {
     const { data, error } = await client
       .from('prescriptions')
       .upsert(
         {
+          id: prescription.id,
+          patient_id: prescription.patientId || null,
           prescription_number: prescription.prescriptionNumber,
           patient_name: prescription.patientName,
           patient_mrn: prescription.patientMrn,
@@ -339,13 +357,15 @@ export async function syncPrescriptionToSupabase(prescription: any) {
 
 // 5. Lab Order Sync
 export async function syncLabOrderToSupabase(order: any) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client) return null;
   try {
     const { data, error } = await client
       .from('lab_orders')
       .upsert(
         {
+          id: order.id,
+          patient_id: order.patientId || null,
           order_number: order.orderNumber,
           patient_name: order.patientName,
           patient_mrn: order.patientMrn,
@@ -379,13 +399,14 @@ export async function syncLabOrderToSupabase(order: any) {
 
 // 6. Inventory Item Sync
 export async function syncInventoryItemToSupabase(item: any) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client) return null;
   try {
     const { data, error } = await client
       .from('inventory_items')
       .upsert(
         {
+          id: item.id,
           sku: item.sku,
           name: item.name,
           generic_name: item.genericName,
@@ -419,13 +440,15 @@ export async function syncInventoryItemToSupabase(item: any) {
 
 // 7. Invoice Sync
 export async function syncInvoiceToSupabase(invoice: any) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client) return null;
   try {
     const { data, error } = await client
       .from('invoices')
       .upsert(
         {
+          id: invoice.id,
+          patient_id: invoice.patientId || null,
           invoice_number: invoice.invoiceNumber,
           patient_name: invoice.patientName,
           patient_mrn: invoice.patientMrn,
@@ -461,10 +484,11 @@ export async function syncInvoiceToSupabase(invoice: any) {
 
 // 8. Audit Log Sync
 export async function syncAuditLogToSupabase(log: any) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client) return null;
   try {
     await client.from('audit_logs').insert({
+      id: log.id || `aud-${Date.now()}`,
       timestamp: log.timestamp,
       user_id: log.userId,
       user_name: log.userName,
@@ -575,7 +599,7 @@ export async function syncAllClinicDataToSupabase(data: {
  * Enforces .eq('patient_id', patientId) hard filter.
  */
 export async function fetchIsolatedPatientAppointments(patientId: string) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client || !patientId) return [];
   try {
     const { data, error } = await client
@@ -598,7 +622,7 @@ export async function fetchIsolatedPatientAppointments(patientId: string) {
  * Enforces .eq('id', patientId) hard filter.
  */
 export async function fetchIsolatedPatientRecord(patientId: string) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client || !patientId) return null;
   try {
     const { data, error } = await client
@@ -622,7 +646,7 @@ export async function fetchIsolatedPatientRecord(patientId: string) {
  * Enforces .eq('patient_id', patientId) hard filter.
  */
 export async function fetchIsolatedPatientPrescriptions(patientId: string) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client || !patientId) return [];
   try {
     const { data, error } = await client
@@ -645,7 +669,7 @@ export async function fetchIsolatedPatientPrescriptions(patientId: string) {
  * Enforces .eq('patient_id', patientId) hard filter.
  */
 export async function fetchIsolatedPatientLabOrders(patientId: string) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client || !patientId) return [];
   try {
     const { data, error } = await client
@@ -668,7 +692,7 @@ export async function fetchIsolatedPatientLabOrders(patientId: string) {
  * Enforces .eq('patient_id', patientId) hard filter.
  */
 export async function fetchIsolatedPatientInvoices(patientId: string) {
-  const client = getSupabaseClient();
+  const client = await getAuthenticatedBrowserSupabaseClient();
   if (!client || !patientId) return [];
   try {
     const { data, error } = await client
@@ -686,4 +710,46 @@ export async function fetchIsolatedPatientInvoices(patientId: string) {
   }
 }
 
+/**
+ * Privacy-preserving appointment slot availability lookup via SECURITY DEFINER RPC.
+ * Returns only doctor_id, appointment_date, appointment_time, duration_minutes, and status (no PHI).
+ */
+export async function fetchBookedAppointmentSlots(targetDate?: string, doctorId?: string) {
+  const client = await getAuthenticatedBrowserSupabaseClient();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.rpc('get_booked_appointment_slots', {
+      p_date: targetDate || null,
+      p_doctor_id: doctorId || null,
+    });
+    if (error) {
+      console.warn('Booked appointment slots RPC error:', error.message);
+      return [];
+    }
+    return data || [];
+  } catch (err: any) {
+    console.warn('Booked appointment slots RPC exception:', err?.message);
+    return [];
+  }
+}
 
+/**
+ * Generates a short-lived signed URL for private medical-attachments objects (<patient_id>/<filename>).
+ */
+export async function getSignedMedicalAttachmentUrl(objectPath: string, expiresInSec = 300): Promise<string | null> {
+  const client = await getAuthenticatedBrowserSupabaseClient();
+  if (!client || !objectPath) return null;
+  try {
+    const { data, error } = await client.storage
+      .from('medical-attachments')
+      .createSignedUrl(objectPath, expiresInSec);
+    if (error) {
+      console.warn('Signed medical attachment URL error:', error.message);
+      return null;
+    }
+    return data?.signedUrl || null;
+  } catch (err: any) {
+    console.warn('Signed medical attachment URL exception:', err?.message);
+    return null;
+  }
+}

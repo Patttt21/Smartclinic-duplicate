@@ -431,9 +431,49 @@ export function processSchedulingMessage(
 // PART 9 — APPOINTMENT, WALK-IN CAPACITY, GRACE PERIOD & NO-SHOW RULES
 // ============================================================================
 
-export const DEFAULT_NO_SHOW_GRACE_MINUTES = 20; // Configurable between 15 and 30 minutes
-export const MIN_NO_SHOW_GRACE_MINUTES = 15;
-export const MAX_NO_SHOW_GRACE_MINUTES = 30;
+export const DEFAULT_NO_SHOW_GRACE_MINUTES = 30; // Configurable operational grace period (initial default: 30 minutes)
+export const MIN_NO_SHOW_GRACE_MINUTES = 5;
+export const MAX_NO_SHOW_GRACE_MINUTES = 120;
+
+export const NO_SAME_DAY_BOOKING_MESSAGE =
+  'Same-day online booking is unavailable. Please select an available date starting tomorrow.';
+
+/**
+ * Validates that a patient online booking date is strictly tomorrow or later in Asia/Manila time.
+ * Applies to both In-Person and Online Consultation bookings.
+ */
+export function validatePatientBookingDateManila(
+  dateStr: string,
+  now: Date = new Date()
+): { valid: boolean; earliestBookableDate: string; todayManila: string; error?: string } {
+  const todayManila = getManilaDateString(now);
+  const earliestBookableDate = addOneCalendarDay(todayManila);
+  const cleanTarget = normalizeDateForComparison(dateStr);
+
+  if (!cleanTarget || !/^\d{4}-\d{2}-\d{2}$/.test(cleanTarget)) {
+    return {
+      valid: false,
+      earliestBookableDate,
+      todayManila,
+      error: 'Please select a valid appointment date.',
+    };
+  }
+
+  if (cleanTarget <= todayManila) {
+    return {
+      valid: false,
+      earliestBookableDate,
+      todayManila,
+      error: NO_SAME_DAY_BOOKING_MESSAGE,
+    };
+  }
+
+  return {
+    valid: true,
+    earliestBookableDate,
+    todayManila,
+  };
+}
 
 export function normalizeSlot24(timeStr: string): string {
   const mins = parseTimeMinutes(timeStr);
@@ -524,36 +564,95 @@ export function canPatientRebookOnDate(params: {
 }
 
 /**
- * Prevents double-booking of the same physician slot and prevents duplicate active queue entries
- * for the same patient on the same Manila date.
+ * Checks whether two time intervals [startA, endA) and [startB, endB) overlap.
+ */
+export function doTimeIntervalsOverlap(
+  startMinutesA: number,
+  durationMinutesA: number,
+  startMinutesB: number,
+  durationMinutesB: number,
+  bufferMinutes = 0
+): boolean {
+  const endA = startMinutesA + Math.max(15, durationMinutesA) + Math.max(0, bufferMinutes);
+  const endB = startMinutesB + Math.max(15, durationMinutesB) + Math.max(0, bufferMinutes);
+  return startMinutesA < endB && startMinutesB < endA;
+}
+
+/**
+ * Prevents double-booking and overlapping appointments (across both In-Person and Online Consultation)
+ * for the same physician on the same Manila date, accounting for duration and optional schedule buffer.
  */
 export function validateAppointmentSlotBooking(params: {
   patientId: string;
   doctorId: string;
   date: string;
   time: string;
+  durationMinutes?: number;
+  bufferMinutes?: number;
   appointments: Appointment[];
   excludeAppointmentId?: string;
   checkDuplicateQueue?: boolean;
-}): { valid: boolean; error?: string } {
+}): { valid: boolean; error?: string; conflictingAppointmentId?: string } {
   const cleanDate = getManilaDateString(params.date);
   const cleanTime = normalizeSlot24(params.time);
+  const targetStartMins = parseTimeMinutes(cleanTime);
+  const targetDuration = Math.max(15, Number(params.durationMinutes) || 30);
+  const bufferMins = Math.max(0, Number(params.bufferMinutes) || 0);
 
-  const slotConflict = params.appointments.find(
-    (a) =>
-      !a.isSynthetic &&
-      a.id !== params.excludeAppointmentId &&
-      a.doctorId === params.doctorId &&
-      getManilaDateString(a.date) === cleanDate &&
-      normalizeSlot24(a.time) === cleanTime &&
-      isSlotReservingStatus(a.status) &&
-      !a.isWalkIn
-  );
+  if (targetStartMins === null) {
+    return {
+      valid: false,
+      error: 'Invalid appointment time format. Please select an available schedule slot.',
+    };
+  }
+
+  const slotConflict = params.appointments.find((a) => {
+    if (a.isSynthetic) return false;
+    if (a.id === params.excludeAppointmentId) return false;
+    if (a.doctorId !== params.doctorId) return false;
+    if (getManilaDateString(a.date) !== cleanDate) return false;
+    if (!isSlotReservingStatus(a.status)) return false;
+    if (a.isWalkIn || a.type === 'Walk-In') return false;
+
+    const existingStartMins = parseTimeMinutes(a.time);
+    if (existingStartMins === null) {
+      return normalizeSlot24(a.time) === cleanTime;
+    }
+    const existingDuration = Math.max(15, Number(a.durationMinutes) || 30);
+    return doTimeIntervalsOverlap(
+      targetStartMins,
+      targetDuration,
+      existingStartMins,
+      existingDuration,
+      bufferMins
+    );
+  });
 
   if (slotConflict) {
     return {
       valid: false,
-      error: `Selected time slot (${cleanTime}) on ${cleanDate} is already reserved. Double-booking is not permitted.`,
+      conflictingAppointmentId: slotConflict.id,
+      error: `Selected time slot (${cleanTime}) on ${cleanDate} conflicts with an existing ${slotConflict.consultationMode || slotConflict.type || 'scheduled'} appointment for this doctor. Double-booking is not permitted.`,
+    };
+  }
+
+  // Also prevent the same patient from booking two overlapping appointments at the exact same date & time
+  const patientSelfOverlap = params.appointments.find((a) => {
+    if (a.isSynthetic) return false;
+    if (a.id === params.excludeAppointmentId) return false;
+    if (a.patientId !== params.patientId) return false;
+    if (getManilaDateString(a.date) !== cleanDate) return false;
+    if (!isSlotReservingStatus(a.status)) return false;
+    const existingStart = parseTimeMinutes(a.time);
+    if (existingStart === null) return false;
+    return doTimeIntervalsOverlap(targetStartMins, targetDuration, existingStart, Math.max(15, Number(a.durationMinutes) || 30), 0);
+  });
+
+  if (patientSelfOverlap && !params.checkDuplicateQueue) {
+    return {
+      valid: false,
+      conflictingAppointmentId: patientSelfOverlap.id,
+      error: `You already have an active appointment scheduled on ${cleanDate} at ${normalizeSlot24(patientSelfOverlap.time)}.`,
     };
   }
 
@@ -569,7 +668,7 @@ export function validateAppointmentSlotBooking(params: {
     if (duplicateQueue) {
       return {
         valid: false,
-        error: `Patient already has an active queue entry (${duplicateQueue.queueNumber || duplicateQueue.id} — ${duplicateQueue.status}) today.`,
+        error: `Patient already has an active walk-in/visit entry (${duplicateQueue.queueNumber || duplicateQueue.bookingReference || duplicateQueue.id} — ${duplicateQueue.status}) today.`,
       };
     }
   }
@@ -620,7 +719,6 @@ export function evaluateWalkInCapacity(params: {
   const usedSlots = reservedOnlineCount + activeWalkInCount;
   const remainingWalkInCapacity = Math.max(0, totalDailySlots - usedSlots);
 
-  // Build candidate 30-min slots to find the first unreserved slot for walk-in placement
   const takenTimes = new Set(dayApts.map((a) => normalizeSlot24(a.time)));
   let suggestedSlotTime: string | null = null;
   for (let h = startHour; h < endHour; h++) {
@@ -661,6 +759,7 @@ export function evaluateWalkInCapacity(params: {
 
 /**
  * Determines if a Scheduled or Confirmed appointment has exceeded the clinic's no-show grace period.
+ * Default grace period is 30 minutes after the scheduled slot in Asia/Manila time.
  */
 export function isAppointmentEligibleForNoShow(
   apt: Appointment,
@@ -683,5 +782,6 @@ export function isAppointmentEligibleForNoShow(
     clampedGraceMinutes,
   };
 }
+
 
 

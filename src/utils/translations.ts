@@ -293,9 +293,9 @@ export const translations: Record<AppLanguage, Translations> = {
       reports: 'Reports & Analytics',
       predictiveAnalytics: 'Predictive Analytics',
       aiAssistant: 'AI Clinical Triage',
-      auditLogs: 'Audit Logs & RA 10173',
+      auditLogs: 'Security & Audit Logs',
       notifications: 'Notifications',
-      scanHealthId: 'Scan Health ID',
+      scanHealthId: 'Scan Appointment QR',
       signIn: 'Sign In',
       signOut: 'Sign Out',
       profileSettings: 'Profile Settings',
@@ -348,7 +348,7 @@ export const translations: Record<AppLanguage, Translations> = {
       inactivityNotice: 'Auto logout on inactivity',
       open24Hours: 'Open 24 Hours • 7 Days a Week',
       emergencyHotline: 'Emergency Hotline: Globe +639154050623',
-      privacyCertified: 'Data Privacy Act (RA 10173) Certified',
+      privacyCertified: 'Role-Based Access & Data Isolation',
     },
     home: {
       bannerNotice: 'Accredited with PhilHealth & Major HMOs',
@@ -376,7 +376,7 @@ export const translations: Record<AppLanguage, Translations> = {
       feat2Title: 'Live Queue & Waiting Room',
       feat2Desc: 'Monitor your queue position live from home or mobile to minimize waiting room congestion.',
       feat3Title: 'Electronic Medical Records (EMR)',
-      feat3Desc: 'Confidential diagnostic history, chronic conditions, and vital sign trajectories protected by RA 10173.',
+      feat3Desc: 'Confidential diagnostic history, chronic conditions, and vital sign trajectories protected by role-based access controls.',
       feat4Title: 'Digital e-Prescriptions',
       feat4Desc: 'Receive verifiable digital prescriptions with dosage instructions and pharmacy inventory sync.',
       feat5Title: 'Diagnostic Lab Pathology',
@@ -392,7 +392,7 @@ export const translations: Record<AppLanguage, Translations> = {
         'Click the "Book an Appointment" button above, select your preferred specialty or doctor, pick an available time slot, and confirm. You will receive an instant email and SMS confirmation.',
       faq2Q: 'Is my health data private and secured?',
       faq2A:
-        'Yes. Smart Clinic strictly complies with the Philippine Data Privacy Act of 2012 (RA 10173). Patient records are encrypted and isolated so that only you and your attending physician have access.',
+        'Patient records in this prototype use row-level and role-based access controls so that patients can only view their own records alongside authorized clinic staff.',
       faq3Q: 'How does the Live Queue work?',
       faq3A:
         'When you arrive at the clinic or check in online, your position is assigned. You can monitor the live waiting board from your phone and arrive right before your turn.',
@@ -403,7 +403,7 @@ export const translations: Record<AppLanguage, Translations> = {
         'Smart Clinic is a patient-centered outpatient medical center providing primary care, specialist consultations, and diagnostic laboratory services.',
       quickLinks: 'Quick Links',
       emergencyHeading: 'Emergency Assistance',
-      rightsReserved: 'All rights reserved. Aligned with Philippine Health Data Security Standards (RA 10173).',
+      rightsReserved: 'All rights reserved. Academic Capstone Healthcare Prototype (Synthetic Data Only).',
     },
     auth: {
       portalTitle: 'Smart Clinic Authentication',
@@ -431,7 +431,7 @@ export const translations: Record<AppLanguage, Translations> = {
       loginHere: 'Log in here',
       authenticatorNotice: 'Mandatory two-factor authentication required for clinical administrative accounts.',
       captchaVerification: 'Security Verification (Anti-Bot)',
-      privacyAgreement: 'I agree to the Collection and Processing of Health Data under RA 10173.',
+      privacyAgreement: 'I agree to the Prototype Patient Data Privacy Notice for synthetic health records.',
       privacyLink: 'View Privacy Policy',
       dobLabel: 'Date of Birth',
       ageLabel: 'Age',
@@ -502,7 +502,7 @@ export const translations: Record<AppLanguage, Translations> = {
       triageIntake: 'Nurse Triage & Vitals Intake',
       checkInPatient: 'Check In Patient',
       recordVitals: 'Record Vital Signs',
-      scanHealthId: 'Scan Health ID QR',
+      scanHealthId: 'Scan Appointment QR',
       priorityEmergency: 'Emergency (Immediate)',
       priorityUrgent: 'Urgent Priority',
       priorityRoutine: 'Standard Routine',
@@ -518,12 +518,12 @@ export const translations: Record<AppLanguage, Translations> = {
       appointmentsToday: 'Appointments Today',
       revenueToday: "Today's Clinic Revenue",
       lowStockAlerts: 'Low Formulary Stock Items',
-      complianceAudit: 'Data Security & Audit Trail (RA 10173)',
+      complianceAudit: 'Data Security & Audit Trail',
       addDoctorBtn: 'Register New Physician',
       addStaffBtn: 'Register New Clinical Staff',
       systemLogs: 'System Security Audit Logs',
       manageStaff: 'Register and Managing Doctor and Clinical Staff',
-      dataSecurityStatus: 'RA 10173 Compliance Status: Active & Encrypted',
+      dataSecurityStatus: 'Role-Based Access Control Status: Active',
     },
     session: {
       warningTitle: '⚠️ Session Expiration Warning',
@@ -533,10 +533,10 @@ export const translations: Record<AppLanguage, Translations> = {
       stayLoggedInBtn: 'Stay Signed In',
       logOutBtn: 'Log Out',
       roleTimeoutInfo: 'Role Inactivity Timeout Policy',
-      doctorTimeout: 'Clinic Staff (Physician): 15 minutes',
-      staffTimeout: 'Clinic Staff: 15 minutes',
-      patientTimeout: 'Patient: 30 minutes',
-      adminTimeout: 'Administrator: 15 minutes',
+      doctorTimeout: 'All Clinic Roles: 10 minutes',
+      staffTimeout: 'All Clinic Roles: 10 minutes',
+      patientTimeout: 'All Clinic Roles: 10 minutes',
+      adminTimeout: 'All Clinic Roles: 10 minutes',
       expiredToast: 'Your session has expired due to inactivity. Please log in again.',
     },
   },
@@ -557,7 +557,7 @@ export const translations: Record<AppLanguage, Translations> = {
       reports: 'Ulat at Estadistika',
       predictiveAnalytics: 'Pagtataya ng Panganib',
       aiAssistant: 'AI Katulong sa Triage',
-      auditLogs: 'Talaan ng Pagsusuri (RA 10173)',
+      auditLogs: 'Talaan ng Seguridad at Audit',
       notifications: 'Mga Abiso',
       scanHealthId: 'I-scan ang Health ID',
       signIn: 'Mag-sign In',
@@ -612,7 +612,7 @@ export const translations: Record<AppLanguage, Translations> = {
       inactivityNotice: 'Kusang magla-logout kapag walang aktibidad',
       open24Hours: 'Bukas 24 Oras • 7 Araw sa Isang Linggo',
       emergencyHotline: 'Emergency Hotline: Globe +639154050623',
-      privacyCertified: 'Sertipikado sa Data Privacy Act (RA 10173)',
+      privacyCertified: 'Role-Based Access at Proteksyon ng Datos',
     },
     home: {
       bannerNotice: 'Akreditado sa PhilHealth at mga Pangunahing HMO',
@@ -640,7 +640,7 @@ export const translations: Record<AppLanguage, Translations> = {
       feat2Title: 'Kasalukuyang Pila (Live Queue)',
       feat2Desc: 'Alamin ang iyong puwesto sa pila mula sa bahay o telepono upang maiwasan ang siksikan sa klinika.',
       feat3Title: 'Elektronikong Rekord Medikal (EMR)',
-      feat3Desc: 'Ligtas at kumpidensyal na talaan ng kasaysayang medikal at gamutan alinsunod sa batas ng RA 10173.',
+      feat3Desc: 'Ligtas at kumpidensyal na talaan ng kasaysayang medikal at gamutan gamit ang role-based access control.',
       feat4Title: 'Digital na mga Reseta',
       feat4Desc: 'Makatanggap ng lehitimong digital na reseta na may tamang dosage at direktang konektado sa botika.',
       feat5Title: 'Pagsusuri at Laboratoryo',
@@ -656,7 +656,7 @@ export const translations: Record<AppLanguage, Translations> = {
         'Pindutin ang "Magpa-appointment Ngayon", piliin ang nararapat na departamento o doktor, pumili ng petsa at oras, at kumpirmahin. Makakatanggap ka agad ng kumpirmasyon sa email at SMS.',
       faq2Q: 'Ligtas ba at kumpidensyal ang aking mga rekord medikal?',
       faq2A:
-        'Oo. Mahigpit naming sinusunod ang Philippine Data Privacy Act ng 2012 (RA 10173). Naka-encrypt at nakahiwalay ang datos ng bawat pasyente upang kayo at ang inyong doktor lamang ang makakita nito.',
+        'Gumagamit ang prototype na ito ng role-based at row-level access controls upang tanging ikaw at ang awtorisadong kawani ng klinika lamang ang makakita ng iyong rekord.',
       faq3Q: 'Paano gumagana ang Live Queue o Kasalukuyang Pila?',
       faq3A:
         'Kapag kayo ay nag-check in sa klinika o online, bibigyan kayo ng numero. Maaari ninyong subaybayan ang takbo ng pila sa inyong cellphone upang pumunta kapag malapit na ang inyong tawag.',
@@ -667,7 +667,7 @@ export const translations: Record<AppLanguage, Translations> = {
         'Ang Smart Clinic ay isang modernong sentro ng pangangalagang medikal na nagbibigay ng pangkalahatang serbisyo, konsultasyon ng espesyalista, at laboratoryo.',
       quickLinks: 'Mabilisang Link',
       emergencyHeading: 'Tulong sa Emerhensya',
-      rightsReserved: 'Lahat ng karapatan ay nakalaan. Alinsunod sa Philippine Health Data Security Standards (RA 10173).',
+      rightsReserved: 'Lahat ng karapatan ay nakalaan. Academic Capstone Healthcare Prototype (Synthetic Data Only).',
     },
     auth: {
       portalTitle: 'Pagpapatotoo sa Smart Clinic',
@@ -695,7 +695,7 @@ export const translations: Record<AppLanguage, Translations> = {
       loginHere: 'Mag-login rito',
       authenticatorNotice: 'Kinakailangan ang two-factor authentication para sa mga medikal at administratibong account.',
       captchaVerification: 'Seguridad (Pagsusuri Laban sa Bot)',
-      privacyAgreement: 'Sumasang-ayon ako sa Pagkolekta at Pagproseso ng Datos Pangkalusugan sa ilalim ng RA 10173.',
+      privacyAgreement: 'Sumasang-ayon ako sa Prototype Patient Data Privacy Notice para sa synthetic health records.',
       privacyLink: 'Basahin ang Patakaran sa Privacy',
       dobLabel: 'Petsa ng Kapanganakan',
       ageLabel: 'Edad',
@@ -782,12 +782,12 @@ export const translations: Record<AppLanguage, Translations> = {
       appointmentsToday: 'Appointment Ngayong Araw',
       revenueToday: 'Kita ng Klinika Ngayon',
       lowStockAlerts: 'Gamot na Mauubos Na',
-      complianceAudit: 'Seguridad ng Datos at Audit (RA 10173)',
+      complianceAudit: 'Seguridad ng Datos at Audit',
       addDoctorBtn: 'Magrehistro ng Bagong Doktor',
       addStaffBtn: 'Magrehistro ng Bagong Kawani',
       systemLogs: 'Talaan ng Seguridad ng Sistema',
       manageStaff: 'Magrehistro at Pamahalaan ang Doktor at mga Kawani',
-      dataSecurityStatus: 'Katayuan sa RA 10173: Aktibo at Naka-encrypt',
+      dataSecurityStatus: 'Katayuan ng Role-Based Access Control: Aktibo',
     },
     session: {
       warningTitle: '⚠️ Babala sa Pag-expire ng Sesyon',
@@ -806,6 +806,6 @@ export const translations: Record<AppLanguage, Translations> = {
   },
 };
 
-export const getTranslation = (lang: AppLanguage): Translations => {
-  return translations[lang] || translations.en;
+export const getTranslation = (_lang?: AppLanguage): Translations => {
+  return translations.en;
 };

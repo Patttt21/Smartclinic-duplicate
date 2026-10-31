@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { useClinic } from '../../context/ClinicContext';
+import { usePrint } from '../../context/PrintContext';
 import { Appointment, AppointmentStatus } from '../../types/clinic';
 import {
   Calendar as CalendarIcon,
@@ -55,6 +56,7 @@ export const AppointmentCalendar: React.FC<Props> = ({
     openBookAppointmentWithDraft,
     t,
   } = useClinic();
+  const { printAppointmentQr, printAppointmentConfirmation } = usePrint();
 
   const isPatient = activeRole === 'patient';
   const todayStr = useMemo(() => new Date().toISOString().split('T')[0], []);
@@ -406,12 +408,12 @@ export const AppointmentCalendar: React.FC<Props> = ({
           <ShieldCheck className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0" />
           <span>
             {isPatient
-              ? 'Data Privacy Enforced: You are viewing solely your verified appointments. Provider directories and other patient records are strictly isolated.'
-              : 'HIPAA & RA 10173 Audit Active: Provider access to appointment records is logged with immutable timestamping.'}
+              ? 'Role-Based Access Active: You are viewing solely your verified appointments. Other patient records are strictly isolated.'
+              : 'Clinical Audit Logging Active: Authorized staff access to appointment schedules is recorded with immutable timestamps.'}
           </span>
         </div>
         <span className="font-mono text-[10px] bg-teal-100 dark:bg-teal-900 text-teal-800 dark:text-teal-300 px-2 py-0.5 rounded font-bold">
-          SECURE RLS
+          ROLE ISOLATED
         </span>
       </div>
 
@@ -869,11 +871,36 @@ export const AppointmentCalendar: React.FC<Props> = ({
                         <span>Dept: {apt.department}</span>
                         <span>•</span>
                         <span>Location: {apt.room || 'Clinic Suite 302'}</span>
-                        {apt.queueNumber && (
+                        {apt.bookingReference && (
                           <>
                             <span>•</span>
                             <span>
-                              Queue:{' '}
+                              Ref:{' '}
+                              <strong className="text-blue-700 dark:text-blue-300 font-mono">
+                                {apt.bookingReference}
+                              </strong>
+                            </span>
+                          </>
+                        )}
+                        {apt.branch && (
+                          <>
+                            <span>•</span>
+                            <span>Branch: {apt.branch}</span>
+                          </>
+                        )}
+                        {apt.consultationMode && (
+                          <>
+                            <span>•</span>
+                            <span className="font-semibold text-slate-700 dark:text-slate-300">
+                              {apt.consultationMode}
+                            </span>
+                          </>
+                        )}
+                        {apt.isWalkIn && apt.queueNumber && (
+                          <>
+                            <span>•</span>
+                            <span>
+                              Walk-In Queue:{' '}
                               <strong className="text-teal-600 dark:text-teal-400 font-mono">
                                 {apt.queueNumber}
                               </strong>
@@ -886,26 +913,29 @@ export const AppointmentCalendar: React.FC<Props> = ({
 
                   {/* Right: Actions */}
                   <div className="flex flex-wrap items-center gap-1.5 self-end md:self-center">
-                    {/* Staff Clinical Workflow Buttons */}
+                    {!apt.isWalkIn && apt.status !== 'Cancelled' && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          apt.consultationMode === 'Online Consultation'
+                            ? printAppointmentConfirmation(apt)
+                            : printAppointmentQr(apt)
+                        }
+                        className="px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-800 dark:bg-blue-950/60 dark:hover:bg-blue-900/80 dark:text-blue-300 rounded-lg font-semibold text-[11px] border border-blue-200 dark:border-blue-800 transition cursor-pointer"
+                      >
+                        {apt.consultationMode === 'Online Consultation' ? 'Print Slip' : 'Print QR'}
+                      </button>
+                    )}
+
+                    {/* Staff Clinical Workflow Buttons (No manual Approve on auto-confirmed bookings) */}
                     {!isPatient && (
                       <>
-                        {apt.status === 'Scheduled' && (
-                          <button
-                            onClick={() => updateAppointmentStatus(apt.id, 'Confirmed')}
-                            className="px-2.5 py-1 bg-teal-50 hover:bg-teal-100 text-teal-800 dark:bg-teal-950/60 dark:hover:bg-teal-900/80 dark:text-teal-300 rounded-lg font-semibold text-[11px] border border-teal-200 dark:border-teal-800 transition cursor-pointer flex items-center gap-1 shadow-2xs"
-                            title="Approve patient appointment"
-                          >
-                            <CheckCircle2 className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
-                            <span>Approve</span>
-                          </button>
-                        )}
-
-                        {(apt.status === 'Scheduled' || apt.status === 'Confirmed') && (
+                        {apt.status === 'Confirmed' && activeRole !== 'doctor' && (
                           <button
                             onClick={() => updateAppointmentStatus(apt.id, 'Checked In')}
                             className="px-2.5 py-1 bg-amber-50 hover:bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:hover:bg-amber-900/80 dark:text-amber-300 rounded-lg font-semibold text-[11px] border border-amber-200 dark:border-amber-800 transition cursor-pointer"
                           >
-                            Check-In
+                            Verify &amp; Check In
                           </button>
                         )}
 

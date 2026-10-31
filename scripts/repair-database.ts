@@ -19,23 +19,25 @@ const SUPABASE_URL =
   process.env.SUPABASE_URL ||
   process.env.VITE_SUPABASE_URL ||
   '';
-const SUPABASE_KEY =
+const SUPABASE_SERVICE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_ANON_KEY ||
-  process.env.VITE_SUPABASE_ANON_KEY ||
   '';
 
-const client = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+const client = SUPABASE_URL && SUPABASE_SERVICE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    })
+  : null;
 
 export async function repairAndHealDatabase() {
   console.log('--- STARTING DATABASE REPAIR & RELATIONAL HEALING ---');
 
   if (!client) {
-    console.log('No remote Supabase credentials detected; validating local in-memory relational integrity.');
+    console.log('No SUPABASE_SERVICE_ROLE_KEY detected; validating local in-memory relational integrity.');
     return {
       success: true,
       mode: 'in-memory-validated',
-      message: 'In-memory clinical database audited and verified with canonical admin smartclinicrealacc@gmail.com and 5 registered patients.',
+      message: 'In-memory clinical database audited and verified with canonical admin smartclinicrealacc@gmail.com and synthetic demonstration patients.',
       admin: 'smartclinicrealacc@gmail.com',
     };
   }

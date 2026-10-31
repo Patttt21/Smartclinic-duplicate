@@ -86,8 +86,9 @@ export const PredictiveAnalyticsDashboard: React.FC = () => {
         branch: branchFilter,
         horizon: String(horizonMonths),
       });
+      const token = authToken || localStorage.getItem('smart_clinic_token');
       const res = await fetch(`${API_BASE_URL}/api/analytics/monthly-forecast?${params.toString()}`, {
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (res.ok) {
         const json = await res.json();

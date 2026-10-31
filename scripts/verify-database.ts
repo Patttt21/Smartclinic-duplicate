@@ -64,6 +64,22 @@ export interface VerificationReport {
   };
 }
 
+function detectSupabaseKeyRole(rawKey: string): 'service_role' | 'anon' | 'none' {
+  if (!rawKey) return 'none';
+  try {
+    const parts = rawKey.split('.');
+    if (parts.length === 3) {
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8'));
+      if (payload?.role === 'service_role') return 'service_role';
+      if (payload?.role === 'anon') return 'anon';
+    }
+  } catch {
+    // Fallback for non-JWT format keys
+  }
+  if (rawKey.startsWith('sb_secret_') || rawKey.includes('service_role')) return 'service_role';
+  return rawKey.length > 20 ? 'anon' : 'none';
+}
+
 export async function runFullDatabaseVerification(
   customUrl?: string,
   customKey?: string
@@ -79,7 +95,7 @@ export async function runFullDatabaseVerification(
       url: url ? url.replace(/:[^:@]+@/, ':***@') : '',
       domain: url ? (url.includes('://') ? new URL(url).hostname : url) : 'Not configured',
       hasKey: Boolean(key),
-      keyType: key.length > 50 ? (key.includes('service_role') ? 'service_role' : 'anon') : 'none',
+      keyType: detectSupabaseKeyRole(key),
       reachable: false,
     },
     adminVerification: {

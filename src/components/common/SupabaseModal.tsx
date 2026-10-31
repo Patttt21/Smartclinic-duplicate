@@ -99,15 +99,15 @@ export const SupabaseModal: React.FC<Props> = ({ onClose }) => {
         setSupabaseCredentials(inputUrl.trim(), inputKey.trim());
         refreshSupabaseConfig();
 
-        if (res.needsGrants) {
+        if (res.rlsProtected) {
           setConnectMessage({
-            type: 'warning',
-            text: 'Connected to Supabase project! Database tables exist, but PostgREST permissions need granting. Click "Copy Grants SQL" below and run it in your Supabase SQL Editor.'
+            type: 'success',
+            text: 'Connection verified! Tables exist and anonymous public access is properly restricted by Row Level Security (RLS).'
           });
         } else if (res.tablesFound === false) {
           setConnectMessage({
             type: 'warning',
-            text: 'Connected to Supabase project! However, database tables have not been created yet. Copy and run the SQL schema below in your Supabase SQL Editor.'
+            text: 'Connected to Supabase project! However, database tables have not been created yet. Apply Migration 001 in your Supabase SQL Editor.'
           });
         } else {
           setConnectMessage({
@@ -399,11 +399,11 @@ export const SupabaseModal: React.FC<Props> = ({ onClose }) => {
                 <button
                   type="button"
                   onClick={handleCopyGrants}
-                  title="Copy the 7-line GRANT query to fix PostgREST 42501 permission denied"
+                  title="Copy least-privilege authenticated role grants (no anonymous public access)"
                   className="px-2 py-1 text-[11px] bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-md font-semibold flex items-center gap-1 cursor-pointer transition"
                 >
                   {copiedGrants ? <Check className="w-3.5 h-3.5 text-amber-600" /> : <ShieldCheck className="w-3.5 h-3.5 text-amber-600" />}
-                  <span>{copiedGrants ? 'Grants Copied!' : 'Copy Grants SQL (Fix 42501)'}</span>
+                  <span>{copiedGrants ? 'Scoped Grants Copied!' : 'Copy Scoped Grants SQL'}</span>
                 </button>
                 <button
                   type="button"
@@ -411,7 +411,7 @@ export const SupabaseModal: React.FC<Props> = ({ onClose }) => {
                   className="px-2 py-1 text-[11px] bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-md font-semibold flex items-center gap-1 cursor-pointer transition"
                 >
                   {copiedSchema ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedSchema ? 'SQL Copied!' : 'Copy Full SQL (222 lines)'}</span>
+                  <span>{copiedSchema ? 'SQL Copied!' : 'Copy Hardened Schema SQL'}</span>
                 </button>
               </div>
             </div>
@@ -432,7 +432,7 @@ export const SupabaseModal: React.FC<Props> = ({ onClose }) => {
                 { name: 'lab_orders', desc: 'Pathology & AI analysis' },
                 { name: 'inventory_items', desc: 'Pharmacy & stock levels' },
                 { name: 'invoices', desc: 'Billing, taxes & payments' },
-                { name: 'audit_logs', desc: 'RA 10173 tamper-evident logs' },
+                { name: 'audit_logs', desc: 'Immutable administrative audit logs' },
               ].map((table) => (
                 <div key={table.name} className="p-2.5 rounded-lg border border-slate-200 bg-white">
                   <div className="font-mono font-semibold text-[11px] text-emerald-700">
@@ -459,16 +459,16 @@ export const SupabaseModal: React.FC<Props> = ({ onClose }) => {
             </div>
             <ol className="text-xs text-slate-400 space-y-1.5 list-decimal list-inside leading-relaxed">
               <li>
-                Click <strong className="text-emerald-400">"Copy Full SQL"</strong> above.
+                Click <strong className="text-emerald-400">"Copy Hardened Schema SQL"</strong> above (or apply <code className="text-sky-300">supabase/migrations/001_smartclinic_v2_schema_and_rls.sql</code>).
               </li>
               <li>
                 Open your <strong className="text-slate-200">Supabase Dashboard</strong> ➔ <strong className="text-slate-200">SQL Editor</strong>, paste, and click <strong className="text-emerald-400">Run</strong>.
               </li>
               <li>
-                Copy your <strong className="text-slate-200">Project URL</strong> and <strong className="text-slate-200">anon key</strong> from Supabase Project Settings ➔ API.
+                Copy your <strong className="text-slate-200">Project URL</strong> and <strong className="text-slate-200">anon key</strong> from Supabase Project Settings ➔ API (set <code className="text-sky-300">SUPABASE_SERVICE_ROLE_KEY</code> on the server only).
               </li>
               <li>
-                Paste them into the connect form above and click <strong className="text-emerald-400">"Connect & Test"</strong> (or paste them to your <code className="text-sky-300">.env</code> file).
+                Paste them into the connect form above and click <strong className="text-emerald-400">"Connect & Test"</strong>.
               </li>
             </ol>
           </div>
@@ -478,7 +478,7 @@ export const SupabaseModal: React.FC<Props> = ({ onClose }) => {
         <div className="px-6 py-3 border-t border-slate-100 bg-slate-50 flex items-center justify-between text-xs">
           <div className="flex items-center gap-1.5 text-slate-500">
             <ShieldCheck className="w-4 h-4 text-emerald-600" />
-            <span>Row Level Security (RLS) & Philippine RA 10173 compliance</span>
+            <span>Role-Based Row Level Security (RLS) & Tenant Isolation</span>
           </div>
           <button
             onClick={onClose}

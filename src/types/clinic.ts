@@ -20,6 +20,7 @@ export interface UserPermissions {
   laboratory: boolean;
   billing: boolean;
   reports: boolean;
+  predictiveAnalytics?: boolean;
   auditLogs: boolean;
   aiAssistant: boolean;
 }
@@ -38,6 +39,7 @@ export const DEFAULT_ROLE_PERMISSIONS: Record<UserRole, UserPermissions> = {
     laboratory: true,
     billing: true,
     reports: true,
+    predictiveAnalytics: true,
     auditLogs: true,
     aiAssistant: true,
   },
@@ -45,15 +47,16 @@ export const DEFAULT_ROLE_PERMISSIONS: Record<UserRole, UserPermissions> = {
     dashboard: true,
     patients: true,
     appointments: true,
-    queue: true,
+    queue: false,
     triage: false,
     consultations: true,
     emr: true,
     prescriptions: true,
-    pharmacy: false,
+    pharmacy: true,
     laboratory: true,
     billing: false,
     reports: false,
+    predictiveAnalytics: true,
     auditLogs: false,
     aiAssistant: true,
   },
@@ -70,6 +73,7 @@ export const DEFAULT_ROLE_PERMISSIONS: Record<UserRole, UserPermissions> = {
     laboratory: true,
     billing: false,
     reports: false,
+    predictiveAnalytics: true,
     auditLogs: false,
     aiAssistant: true,
   },
@@ -86,6 +90,7 @@ export const DEFAULT_ROLE_PERMISSIONS: Record<UserRole, UserPermissions> = {
     laboratory: false,
     billing: true,
     reports: false,
+    predictiveAnalytics: true,
     auditLogs: false,
     aiAssistant: true,
   },
@@ -101,7 +106,8 @@ export const DEFAULT_ROLE_PERMISSIONS: Record<UserRole, UserPermissions> = {
     pharmacy: true,
     laboratory: false,
     billing: false,
-    reports: false,
+    reports: true,
+    predictiveAnalytics: false,
     auditLogs: false,
     aiAssistant: true,
   },
@@ -117,7 +123,8 @@ export const DEFAULT_ROLE_PERMISSIONS: Record<UserRole, UserPermissions> = {
     pharmacy: false,
     laboratory: true,
     billing: false,
-    reports: false,
+    reports: true,
+    predictiveAnalytics: false,
     auditLogs: false,
     aiAssistant: true,
   },
@@ -125,22 +132,28 @@ export const DEFAULT_ROLE_PERMISSIONS: Record<UserRole, UserPermissions> = {
     dashboard: true,
     patients: false,
     appointments: true,
-    queue: true,
+    queue: false,
     triage: false,
-    consultations: false,
+    consultations: true,
     emr: true,
     prescriptions: true,
     pharmacy: false,
     laboratory: true,
     billing: true,
     reports: false,
+    predictiveAnalytics: false,
     auditLogs: false,
     aiAssistant: true,
   },
 };
 
+export type ClinicBranch = 'Main Outpatient Clinic' | 'Annex Satellite Clinic';
+
+export type ConsultationMode = 'In-Person' | 'Online Consultation';
+
 export interface User {
   id: string;
+  authUserId?: string;
   name: string;
   email: string;
   role: UserRole;
@@ -150,6 +163,8 @@ export interface User {
   specialty?: string;
   licenseNumber?: string;
   phone?: string;
+  branches?: ClinicBranch[];
+  consultationModes?: ConsultationMode[];
   workDays?: number[];
   workDaysLabel?: string;
   hoursLabel?: string;
@@ -166,10 +181,17 @@ export interface User {
   updatedAt?: string;
 }
 
+export type VitalsSource = 'nurse-intake' | 'doctor-consultation' | 'patient-reported';
+
 export interface Vitals {
   id?: string;
   recordedAt: string;
   recordedBy: string;
+  recordedById?: string;
+  recordedByRole?: UserRole;
+  appointmentId?: string;
+  source?: VitalsSource;
+  isPatientReported?: boolean;
   bloodPressureSystolic: number; // mmHg
   bloodPressureDiastolic: number; // mmHg
   heartRate: number; // bpm
@@ -196,13 +218,13 @@ export interface TriageRecord {
   patientName?: string;
   timestamp: string;
   symptoms: string;
-  timelineStarted: string; // e.g. "Today", "1-3 days ago", "1 week ago", "Weeks/months ago"
+  timelineStarted: string;
   timelineTrajectory: 'improving' | 'worsening' | 'stable';
-  previousEpisodes: string; // e.g. "First time", "Recurring", "Chronic/ongoing"
-  urgencyScore: number; // 1 to 10
+  previousEpisodes: string;
+  urgencyScore: number;
   urgencyBand: UrgencyBand;
-  urgencyLabel: string; // e.g. "Green (1-3): Can wait for regular appointment", etc.
-  suggestedSpecialty: string; // e.g. "Cardiology", "Pulmonology", "General Medicine"
+  urgencyLabel: string;
+  suggestedSpecialty: string;
   summary: string;
   actionRecommended: string;
   isEmergency: boolean;
@@ -212,6 +234,7 @@ export interface TriageRecord {
 
 export interface Patient {
   id: string;
+  authUserId?: string;
   mrn: string; // Medical Record Number e.g. MRN-2026-081
   fullName: string;
   dob: string;
@@ -239,8 +262,6 @@ export interface Patient {
   triageHistory?: TriageRecord[];
 }
 
-export type ClinicBranch = 'Main Outpatient Clinic' | 'Annex Satellite Clinic';
-
 export type SymptomConsultationCategory =
   | 'Fever-related Consultations'
   | 'Cough-related Consultations'
@@ -263,30 +284,47 @@ export type AppointmentStatus =
 
 export interface Appointment {
   id: string;
+  bookingReference?: string;
+  qrToken?: string;
+  qrPayload?: string;
   patientId: string;
   patientName: string;
   patientMrn: string;
   doctorId: string;
   doctorName: string;
   department: string;
+  specialty?: string;
   branch?: ClinicBranch;
   date: string; // YYYY-MM-DD (Asia/Manila)
   time: string; // HH:mm
   durationMinutes: number;
   reason: string;
   status: AppointmentStatus;
-  type: 'In-Person' | 'Telehealth' | 'Follow-up' | 'Emergency' | 'Consultation' | 'Check-up' | 'Walk-In';
+  type: 'In-Person' | 'Online Consultation' | 'Telehealth' | 'Follow-up' | 'Emergency' | 'Consultation' | 'Check-up' | 'Walk-In';
+  consultationMode?: ConsultationMode;
   isWalkIn?: boolean;
   isSynthetic?: boolean;
   rescheduledFromId?: string;
   serviceCategory?: string;
+  confirmedAt?: string;
   checkInAt?: string;
+  checkedInBy?: string;
   calledAt?: string;
+  calledBy?: string;
   calledAcknowledgedAt?: string;
+  consultationStartedAt?: string;
   completedAt?: string;
   noShowMarkedAt?: string;
+  noShowMarkedBy?: string;
   staffOverrideBy?: string;
   staffOverrideReason?: string;
+  nurseVitalsRecorded?: boolean;
+  nurseVitalsRecordedAt?: string;
+  nurseVitalsRecordedBy?: string;
+  teleconsultRoomId?: string;
+  teleconsultStatus?: 'Scheduled' | 'Waiting' | 'Active' | 'Ended';
+  reminder24hSentAt?: string;
+  reminder2hSentAt?: string;
   queueNumber?: string;
   room?: string;
   notes?: string;
@@ -295,15 +333,20 @@ export interface Appointment {
 
 export interface PrescriptionItem {
   id: string;
+  inventoryItemId?: string;
   medicationName: string;
   genericName: string;
   dosage: string;
-  frequency: string; // e.g. "Twice daily after meals"
+  frequency: string;
   route: 'Oral' | 'Sublingual' | 'Topical' | 'Inhalation' | 'Intravenous' | 'Intramuscular';
-  duration: string; // e.g. "7 days"
+  duration: string;
   quantity: number;
+  dispensedQuantity?: number;
+  remainingQuantity?: number;
   instructions: string;
   dispensed?: boolean;
+  dispensedAt?: string;
+  dispensedBy?: string;
 }
 
 export interface Prescription {
@@ -319,15 +362,38 @@ export interface Prescription {
   doctorSpecialty: string;
   doctorLicense: string;
   consultationId?: string;
+  appointmentId?: string;
+  branch?: ClinicBranch;
   date: string;
   items: PrescriptionItem[];
   status: 'Active' | 'Dispensed' | 'Partially Dispensed' | 'Discontinued';
+  dispensedAt?: string;
+  dispensedBy?: string;
   aiSafetyAudit?: {
     checkedAt: string;
     warnings: string[];
     safe: boolean;
   };
   notes?: string;
+}
+
+export type LabOrderStatus =
+  | 'Requested'
+  | 'Sample Collected'
+  | 'Processing'
+  | 'Encoded'
+  | 'Verified'
+  | 'Released'
+  | 'Result Available'
+  | 'Reviewed'
+  | 'Completed';
+
+export interface LabAmendmentEntry {
+  id: string;
+  amendedAt: string;
+  amendedBy: string;
+  reason: string;
+  previousSummary: string;
 }
 
 export interface LabTestOrder {
@@ -339,17 +405,34 @@ export interface LabTestOrder {
   doctorId: string;
   doctorName: string;
   consultationId?: string;
+  appointmentId?: string;
+  branch?: ClinicBranch;
   testName: string;
   category: 'Hematology' | 'Biochemistry' | 'Microbiology' | 'Endocrinology' | 'Urinalysis' | 'Imaging';
   urgency: 'Routine' | 'Urgent' | 'STAT';
-  status: 'Requested' | 'Sample Collected' | 'Processing' | 'Result Available' | 'Reviewed' | 'Completed';
+  status: LabOrderStatus;
   requestedAt: string;
+  patientVerifiedAt?: string;
+  patientVerifiedBy?: string;
+  specimenId?: string;
+  specimenType?: string;
   collectedAt?: string;
+  collectedBy?: string;
+  processedAt?: string;
+  processedBy?: string;
+  encodedAt?: string;
+  encodedBy?: string;
+  verifiedAt?: string;
+  verifiedBy?: string;
+  releasedAt?: string;
+  releasedBy?: string;
   completedAt?: string;
+  isPreliminary?: boolean;
   notes?: string;
   results?: LabResultItem[];
   interpretation?: string;
   aiSummary?: string;
+  amendmentHistory?: LabAmendmentEntry[];
 }
 
 export interface LabResultItem {
@@ -368,6 +451,7 @@ export interface Consultation {
   doctorId: string;
   doctorName: string;
   date: string;
+  consultationMode?: ConsultationMode;
   chiefComplaint: string;
   historyOfPresentIllness: string;
   reviewOfSystems?: string;
@@ -416,7 +500,84 @@ export interface InventoryItem {
   sellingPrice: number;
   unit: 'Tablets' | 'Capsules' | 'Bottles' | 'Vials' | 'Boxes' | 'Packs' | 'Inhalers' | 'Pieces';
   location: string;
+  branch?: ClinicBranch;
   lastUpdated: string;
+}
+
+export interface InventoryTransaction {
+  id: string;
+  inventoryItemId: string;
+  sku: string;
+  medicationName: string;
+  type: 'DISPENSE' | 'RESTOCK' | 'ADJUSTMENT';
+  quantityDelta: number;
+  previousStock: number;
+  newStock: number;
+  prescriptionId?: string;
+  prescriptionNumber?: string;
+  prescriptionItemId?: string;
+  patientId?: string;
+  patientName?: string;
+  performedById: string;
+  performedByName: string;
+  branch?: ClinicBranch;
+  notes?: string;
+  timestamp: string;
+}
+
+export interface RestockRequest {
+  id: string;
+  requestNumber: string;
+  inventoryItemId: string;
+  sku: string;
+  medicationName: string;
+  currentStock: number;
+  reorderLevel: number;
+  requestedQuantity: number;
+  unit: string;
+  supplier: string;
+  branch: ClinicBranch;
+  status: 'Pending Approval' | 'Approved' | 'Received' | 'Cancelled';
+  requestedById: string;
+  requestedByName: string;
+  requestedAt: string;
+  fulfilledAt?: string;
+  fulfilledByName?: string;
+  notes?: string;
+}
+
+export interface NotificationPreferences {
+  patientId: string;
+  emailEnabled: boolean;
+  webPushEnabled: boolean;
+  smsEnabled: boolean;
+  reminder24hEnabled: boolean;
+  reminder2hEnabled: boolean;
+  consentUpdatedAt: string;
+}
+
+export interface ReminderDeliveryLog {
+  id: string;
+  appointmentId: string;
+  bookingReference?: string;
+  patientId: string;
+  reminderType: 'BOOKING_CONFIRMATION' | 'REMINDER_24H' | 'REMINDER_2H' | 'RESCHEDULE_NOTICE' | 'CANCELLATION_NOTICE';
+  channel: 'in_app' | 'email' | 'web_push' | 'sms';
+  status: 'DELIVERED_IN_APP' | 'SENT' | 'SKIPPED_UNCONFIGURED_PROVIDER' | 'SKIPPED_PREFERENCE_DISABLED' | 'FAILED';
+  providerNote: string;
+  scheduledForManila?: string;
+  attemptedAt: string;
+}
+
+export interface ClinicOperationalSettings {
+  noShowGraceMinutes: number;
+  inactivityTimeoutSeconds: number;
+  inactivityWarningSeconds: number;
+  allowOnlineConsultations: boolean;
+  defaultReminder24h: boolean;
+  defaultReminder2h: boolean;
+  updatedAt: string;
+  updatedBy?: string;
 }
 
 export interface InvoiceItem {
@@ -449,7 +610,7 @@ export interface HMOPartner {
   name: string;
   code: string;
   accreditationNumber: string;
-  coverageRate: number; // percentage (e.g. 100 for 100% or 80)
+  coverageRate: number;
   contactHotline: string;
   portalUrl?: string;
   status: 'Active Partner' | 'Under Review' | 'Suspended';
@@ -457,11 +618,11 @@ export interface HMOPartner {
 
 export interface HMOClaim {
   partnerId?: string;
-  partnerName: string; // e.g. Maxicare, Intellicare, Medicard, PhilCare, PhilHealth Konsulta
+  partnerName: string;
   memberId: string;
-  loaNumber: string; // Letter of Authorization / Approval Code
-  coverageAmount: number; // Amount covered by HMO
-  patientShare: number; // Out-of-pocket / co-pay
+  loaNumber: string;
+  coverageAmount: number;
+  patientShare: number;
   claimStatus: HMOClaimStatus;
   approvedDate?: string;
   verifiedBy?: string;
@@ -473,7 +634,7 @@ export interface PaymentDetails {
   amountPaid: number;
   tenderedAmount?: number;
   changeAmount?: number;
-  referenceNumber?: string; // For GCash / Maya / Bank Transfer / Card Auth Code
+  referenceNumber?: string;
   paymentDate: string;
   cashierName?: string;
 }
@@ -546,3 +707,4 @@ export interface AuditLog {
   description: string;
   ipAddress?: string;
 }
+

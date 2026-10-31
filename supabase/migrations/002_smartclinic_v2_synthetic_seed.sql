@@ -68,42 +68,48 @@ ON CONFLICT (id) DO NOTHING;
 
 -- 3. Synthetic Appointments
 INSERT INTO public.appointments (
-  id, patient_id, patient_name, patient_mrn, doctor_id, doctor_name,
-  department, appointment_date, appointment_time, duration_minutes,
-  reason, status, type, queue_number, room
+  id, booking_reference, patient_id, patient_name, patient_mrn, doctor_id, doctor_name,
+  department, branch, appointment_date, appointment_time, duration_minutes,
+  reason, status, type, is_synthetic, queue_number, room
 )
 VALUES
   (
     'apt-v2-001',
+    'BK-SYNTH-1001',
     'pat-v2-001',
     'Juan Dela Cruz (Synthetic)',
     'MRN-V2-1001',
     'usr-doc-1',
     'Dr. Maria Clara Santos, MD (Synthetic)',
     'Internal Medicine',
+    'Main Outpatient Clinic',
     CURRENT_DATE,
     '09:30 AM',
     30,
     'Routine blood pressure evaluation and home log review',
     'Checked In',
     'In-Person',
+    TRUE,
     'Q-101',
     'Room 101'
   ),
   (
     'apt-v2-002',
+    'BK-SYNTH-1002',
     'pat-v2-002',
     'Elena Magtanggol (Synthetic)',
     'MRN-V2-1002',
     'usr-doc-2',
     'Dr. Antonio Reyes, MD (Synthetic)',
     'Family Medicine',
+    'Main Outpatient Clinic',
     CURRENT_DATE,
     '10:30 AM',
     30,
     'Quarterly HbA1c lab follow-up',
     'Scheduled',
     'In-Person',
+    TRUE,
     'Q-102',
     'Room 102'
   )
@@ -111,10 +117,11 @@ ON CONFLICT (id) DO NOTHING;
 
 -- 4. Synthetic Pharmacy Formulary Inventory
 INSERT INTO public.inventory_items (
-  id, sku, name, generic_name, category, form, strength,
-  stock_quantity, reorder_level, unit, unit_price, expiry_date, batch_number, supplier, location
+  id, sku, name, generic_name, brand, category, form, strength,
+  stock_quantity, reorder_level, unit, purchase_price, selling_price, unit_price,
+  expiration_date, expiry_date, batch_number, supplier, location
 )
 VALUES
-  ('inv-v2-001', 'SKU-V2-AML5', 'Norvasc / Amlodipine', 'Amlodipine Besylate', 'Cardiovascular', 'Tablet', '5mg', 180, 40, 'tabs', 14.50, '2027-08-31', 'SYN-B101', 'MetroPharma Synthetic Corp', 'Shelf A-1'),
-  ('inv-v2-002', 'SKU-V2-MET500', 'Glucophage / Metformin', 'Metformin HCl', 'Antidiabetic', 'Tablet', '500mg', 240, 50, 'tabs', 9.75, '2027-11-30', 'SYN-B102', 'MetroPharma Synthetic Corp', 'Shelf B-2')
+  ('inv-v2-001', 'SKU-V2-AML5', 'Norvasc / Amlodipine', 'Amlodipine Besylate', 'Norvasc (Synthetic)', 'Cardiovascular', 'Tablet', '5mg', 180, 40, 'Tablets', 10.00, 14.50, 14.50, '2027-08-31', '2027-08-31', 'SYN-B101', 'MetroPharma Synthetic Corp', 'Shelf A-1'),
+  ('inv-v2-002', 'SKU-V2-MET500', 'Glucophage / Metformin', 'Metformin HCl', 'Glucophage (Synthetic)', 'Antidiabetic', 'Tablet', '500mg', 240, 50, 'Tablets', 6.50, 9.75, 9.75, '2027-11-30', '2027-11-30', 'SYN-B102', 'MetroPharma Synthetic Corp', 'Shelf B-2')
 ON CONFLICT (id) DO NOTHING;
